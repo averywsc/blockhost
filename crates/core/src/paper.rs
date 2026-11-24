@@ -47,6 +47,10 @@ pub fn version_key(v: &str) -> Vec<u32> {
     v.split('.').map(|p| p.parse().unwrap_or(0)).collect()
 }
 
+pub fn list_versions(base: &str) -> Result<Vec<String>> {
+    all_versions(base.trim_end_matches('/'))
+}
+
 fn all_versions(base: &str) -> Result<Vec<String>> {
     let v: serde_json::Value = net::get_json(base)?;
     let groups = v

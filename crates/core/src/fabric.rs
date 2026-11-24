@@ -25,6 +25,17 @@ struct MetaVersion {
     stable: bool,
 }
 
+pub fn list_versions(base: &str) -> Result<Vec<String>> {
+    let base = base.trim_end_matches('/');
+    let games: Vec<MetaVersion> =
+        net::get_json(&format!("{base}/versions/game")).context("could not load Fabric game versions")?;
+    Ok(games
+        .into_iter()
+        .filter(|g| g.stable && !g.version.contains('-'))
+        .map(|g| g.version)
+        .collect())
+}
+
 pub fn resolve(wanted_mc: Option<&str>) -> Result<ResolvedFabric> {
     resolve_from(DEFAULT_FABRIC_META, wanted_mc)
 }

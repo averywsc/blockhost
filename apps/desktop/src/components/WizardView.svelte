@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { api, formatGb, type ServerSoftware, type StatusSnapshot } from "../lib/api";
+  import { api, formatGb, isTauriRuntime, type ServerSoftware, type StatusSnapshot } from "../lib/api";
 
   interface Props {
     status: StatusSnapshot;
@@ -11,9 +11,12 @@
 
   let serverName = $state("my-server");
   let software = $state<ServerSoftware>("paper");
+  let versions = $state<string[]>([]);
+  let selectedVersion = $state("");
+  let loadingVersions = $state(false);
   let ownerUsername = $state("");
   let heapMb = $state(2048);
-  let tunnel = $state(true);
+  let tunnel = $state(false);
   let eulaAccepted = $state(false);
   let initializedRam = $state(false);
 
@@ -22,6 +25,27 @@
       heapMb = status.hardware.recommended_heap_mb;
       initializedRam = true;
     }
+  });
+
+  $effect(() => {
+    const sw = software;
+    selectedVersion = "";
+    if (!isTauriRuntime()) {
+      versions = ["26.1", "1.21.11", "1.21.4", "1.20.4"];
+      return;
+    }
+    loadingVersions = true;
+    api
+      .listMcVersions(sw)
+      .then((list) => {
+        if (software === sw) versions = list.slice(0, 40);
+      })
+      .catch(() => {
+        if (software === sw) versions = [];
+      })
+      .finally(() => {
+        if (software === sw) loadingVersions = false;
+      });
   });
 
   const maxHeap = $derived(Math.max(1024, status.hardware.ram_mb - 1024));
@@ -43,7 +67,7 @@
       await api.createServer({
         name: serverName.trim(),
         software,
-        version: null,
+        version: selectedVersion || null,
         heap_mb: heapMb,
         tunnel,
         owner_username: ownerUsername.trim() || null,
@@ -60,7 +84,7 @@
     <div class="stack-sm">
       <h1 class="page-title">Create your Minecraft server</h1>
       <p class="muted">
-        Pick a name and software. BlockHost handles Java, safe whitelist defaults, and backups automatically.
+        Pick your Minecraft version and software. BlockHost handles Java, safe whitelist defaults, and backups automatically.
       </p>
     </div>
 
@@ -94,7 +118,7 @@
               <span class="badge badge-green">Recommended</span>
             </div>
             <p class="muted small">
-              Best speed on old laptops. Supports plugins from Modrinth. Friends join with normal Minecraft.
+              Fastest speed on old laptops. Supports plugins from Modrinth. Friends join with vanilla Minecraft.
             </p>
           </button>
 
@@ -109,13 +133,25 @@
               <span class="badge badge-blue">Mods</span>
             </div>
             <p class="muted small">
-              Lightweight mod loader. Install Fabric mods from Modrinth or drop jars into your mods folder.
+              Lightweight mod loader. Install Fabric mods from Modrinth or drop jar files into your mods folder.
             </p>
           </button>
         </div>
       </div>
 
-      <div class="two-col">
+      <div class="three-col">
+        <label class="stack-sm">
+          <span class="field-label">Minecraft version</span>
+          <select class="select" bind:value={selectedVersion} disabled={loadingVersions}>
+            <option value="">
+              {loadingVersions ? "Loading versions" : "Latest stable"}
+            </option>
+            {#each versions as v (v)}
+              <option value={v}>{v}</option>
+            {/each}
+          </select>
+        </label>
+
         <label class="stack-sm">
           <span class="field-label">Server name</span>
           <input
@@ -124,18 +160,16 @@
             placeholder="my-server"
             maxlength="32"
           />
-          <span class="muted tiny">Letters, numbers, dashes, and underscores only.</span>
         </label>
 
         <label class="stack-sm">
-          <span class="field-label">Your Minecraft username</span>
+          <span class="field-label">Your username (admin)</span>
           <input
             class="input"
             bind:value={ownerUsername}
             placeholder="e.g. Steve"
             maxlength="16"
           />
-          <span class="muted tiny">Added to the allowed list as server admin.</span>
         </label>
       </div>
 
@@ -165,15 +199,40 @@
         {/if}
       </div>
 
-      <label class="subcard check-row">
-        <input type="checkbox" bind:checked={tunnel} />
-        <div class="stack-xs">
-          <strong>Let friends join over the internet</strong>
-          <span class="muted tiny">
-            Turns on the free playit.gg tunnel. You can switch to direct port forwarding anytime in Network for lower NZ ping.
-          </span>
+      <div class="stack-sm">
+        <span class="field-label">How friends join over the internet</span>
+        <div class="software-grid">
+          <button
+            type="button"
+            class="choice"
+            class:selected={!tunnel}
+            onclick={() => (tunnel = false)}
+          >
+            <div class="row-between">
+              <strong>Direct or Tailscale</strong>
+              <span class="badge badge-green">Best NZ ping</span>
+            </div>
+            <p class="muted small">
+              Skip playit.gg completely. Use direct port forwarding with DuckDNS or Tailscale in Network for lowest lag.
+            </p>
+          </button>
+
+          <button
+            type="button"
+            class="choice"
+            class:selected={tunnel}
+            onclick={() => (tunnel = true)}
+          >
+            <div class="row-between">
+              <strong>Playit.gg tunnel</strong>
+              <span class="badge">No router setup</span>
+            </div>
+            <p class="muted small">
+              Easy free relay if your internet provider blocks port forwarding (CGNAT) and friends do not want Tailscale.
+            </p>
+          </button>
         </div>
-      </label>
+      </div>
 
       <label class="subcard check-row">
         <input type="checkbox" bind:checked={eulaAccepted} />
@@ -201,7 +260,7 @@
 
 <style>
   .wizard-wrap {
-    max-width: 680px;
+    max-width: 720px;
     margin: 12px auto;
   }
 
@@ -214,10 +273,15 @@
     font-weight: 600;
   }
 
-  .software-grid,
-  .two-col {
+  .software-grid {
     display: grid;
     grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+    gap: 12px;
+  }
+
+  .three-col {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
     gap: 12px;
   }
 

@@ -100,6 +100,22 @@
       busy = false;
     }
   }
+
+  async function addLocalJar() {
+    if (!serverName) return;
+    busy = true;
+    try {
+      const msg = await api.importLocalAddon(serverName);
+      if (msg) {
+        onNotify(msg);
+        await refreshInstalled();
+      }
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <div class="stack">
@@ -112,13 +128,18 @@
         </span>
       </div>
       <p class="muted">
-        Search verified Modrinth {noun.toLowerCase()} or open your {isFabric ? "mods" : "plugins"} folder to drop in jar files.
+        Search verified Modrinth {noun.toLowerCase()} or add local .jar files directly.
       </p>
     </div>
 
-    <button class="btn" onclick={() => api.openFolder(serverName, "addons")}>
-      Open {isFabric ? "mods" : "plugins"} folder
-    </button>
+    <div class="row">
+      <button class="btn btn-primary" disabled={busy} onclick={addLocalJar}>
+        Add .jar file
+      </button>
+      <button class="btn" onclick={() => api.openFolder(serverName, "addons")}>
+        Open {isFabric ? "mods" : "plugins"} folder
+      </button>
+    </div>
   </div>
 
   <form

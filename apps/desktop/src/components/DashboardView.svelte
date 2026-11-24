@@ -28,7 +28,20 @@
   const serverName = $derived(status.current ?? "");
   const isRunning = $derived(status.running !== null && status.running === serverName);
   const portSuffix = $derived(status.port && status.port !== 25565 ? `:${status.port}` : "");
-  const internetAddr = $derived(status.tunnel.address ?? status.tunnel.saved_address);
+  const bestInternetAddr = $derived(
+    status.duckdns_domain
+      ? `${status.duckdns_domain}${portSuffix}`
+      : status.tailscale_ip
+        ? `${status.tailscale_ip}${portSuffix}`
+        : status.tunnel.address ?? status.tunnel.saved_address
+  );
+  const internetLabel = $derived(
+    status.duckdns_domain
+      ? "Direct (DuckDNS)"
+      : status.tailscale_ip
+        ? "Direct P2P (Tailscale)"
+        : "Over the internet"
+  );
   const hasUpdate = $derived(
     Boolean(updateInfo && (updateInfo.same_version || updateInfo.latest_major))
   );
@@ -165,6 +178,13 @@
     </div>
   </div>
 
+  {#if status.last_crash && !isRunning}
+    <div class="banner banner-danger stack-xs">
+      <strong>{status.last_crash.title}</strong>
+      <span>{status.last_crash.explanation} {status.last_crash.suggestion}</span>
+    </div>
+  {/if}
+
   {#if hasUpdate}
     <div class="banner banner-info row-between">
       <span>
@@ -213,14 +233,27 @@
     </div>
 
     <div class="card stat">
-      <span class="muted small">Memory limit</span>
-      <strong class="stat-val">{formatGb(status.heap_mb ?? 2048)}</strong>
+      <span class="muted small">Memory usage</span>
+      <strong class="stat-val">
+        {#if isRunning && metrics?.process_ram_mb != null}
+          {formatGb(metrics.process_ram_mb)} / {formatGb(status.heap_mb ?? 2048)}
+        {:else}
+          {formatGb(status.heap_mb ?? 2048)} limit
+        {/if}
+      </strong>
     </div>
 
     <div class="card stat">
-      <span class="muted small">Uptime and world</span>
+      <span class="muted small">{isRunning ? "Uptime and CPU" : "World size"}</span>
       <strong class="stat-val">
-        {isRunning ? formatUptime(status.uptime_secs) : formatSize(status.world_size_bytes)}
+        {#if isRunning}
+          {formatUptime(status.uptime_secs)}
+          {#if metrics?.process_cpu_pct != null}
+            ({Math.round(metrics.process_cpu_pct)}%)
+          {/if}
+        {:else}
+          {formatSize(status.world_size_bytes)}
+        {/if}
       </strong>
     </div>
   </div>
@@ -256,13 +289,13 @@
 
       <div class="subcard row-between">
         <div class="stack-xs">
-          <span class="muted tiny">Over the internet</span>
+          <span class="muted tiny">{internetLabel}</span>
           <span class="mono">
-            {internetAddr ?? (status.tunnel.enabled ? "Waiting for playit address" : "Not configured")}
+            {bestInternetAddr ?? (status.tunnel.enabled ? "Waiting for playit address" : "Set up in Network")}
           </span>
         </div>
-        {#if internetAddr}
-          <button class="btn btn-sm" onclick={() => copy("net", internetAddr)}>
+        {#if bestInternetAddr}
+          <button class="btn btn-sm" onclick={() => copy("net", bestInternetAddr)}>
             {copiedKey === "net" ? "Copied" : "Copy"}
           </button>
         {/if}

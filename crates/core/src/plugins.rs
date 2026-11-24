@@ -264,6 +264,25 @@ pub fn remove_plugin(server_dir: &Path, filename: &str) -> Result<()> {
     remove_addon(server_dir, ServerSoftware::Paper, filename)
 }
 
+/// Copy a user-selected local `.jar` mod or plugin into `mods/` or `plugins/` after verifying
+/// it has a safe `.jar` filename and opens as a valid ZIP/JAR archive.
+pub fn import_local_jar(server_dir: &Path, software: ServerSoftware, source_path: &Path) -> Result<String> {
+    let fname = source_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .context("Could not read filename")?
+        .to_string();
+    if !valid_jar_name(&fname) {
+        bail!("'{fname}' is not a valid .jar mod/plugin filename.");
+    }
+    let file = std::fs::File::open(source_path).context("Could not open selected .jar file.")?;
+    zip::ZipArchive::new(file).context("That file is not a valid Minecraft .jar archive.")?;
+    let dir = addons_dir(server_dir, software);
+    std::fs::create_dir_all(&dir)?;
+    std::fs::copy(source_path, dir.join(&fname))?;
+    Ok(fname)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

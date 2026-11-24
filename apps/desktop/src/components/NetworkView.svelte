@@ -25,12 +25,30 @@
   let forwardResults = $state<{ fw: ActionResult; upnp: ActionResult } | null>(null);
   let forwarding = $state(false);
   let playitInput = $state("");
+  let duckDomain = $state("");
+  let duckToken = $state("");
+  let savingDuck = $state(false);
 
   const serverName = $derived(status.current ?? "");
 
   $effect(() => {
     playitInput = status.tunnel.saved_address ?? status.tunnel.address ?? "";
+    duckDomain = status.duckdns_domain ?? "";
   });
+
+  async function saveDuckDns() {
+    if (!serverName) return;
+    savingDuck = true;
+    try {
+      const msg = await api.saveDuckdns(serverName, duckDomain.trim(), duckToken.trim());
+      onNotify(msg);
+      duckToken = "";
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      savingDuck = false;
+    }
+  }
 
   async function refreshOverview() {
     loadingOverview = true;
@@ -168,15 +186,26 @@
   <div class="card stack">
     <div class="row-between">
       <div class="stack-xs">
-        <h2 class="section-title">One-click port forward (lowest NZ ping)</h2>
+        <div class="row">
+          <h2 class="section-title">Option 1: Direct port forward and free DuckDNS</h2>
+          <span class="badge badge-green">Best NZ ping (no playit.gg)</span>
+        </div>
         <span class="muted tiny">
-          Asks your router via UPnP to forward TCP port {status.port ?? 25565} and adds a Windows Firewall rule.
+          Connects friends directly over NZ fibre (~5 to 15 ms). Forward TCP port {status.port ?? 25565} and add a free DuckDNS name so friends never need to type a changing IP.
         </span>
       </div>
       <div class="row">
         <button class="btn btn-primary" disabled={forwarding} onclick={setupForward}>
           {forwarding ? "Working" : "Enable port forward"}
         </button>
+        {#if overview?.link?.gateway}
+          <button
+            class="btn"
+            onclick={() => overview?.link?.gateway && api.openUrl(`http://${overview.link.gateway}`)}
+          >
+            Open router page
+          </button>
+        {/if}
         <button class="btn" disabled={forwarding} onclick={removeForward}>Remove</button>
       </div>
     </div>
@@ -191,12 +220,58 @@
         </div>
       </div>
     {/if}
+
+    <form
+      class="two-col"
+      onsubmit={(e) => {
+        e.preventDefault();
+        saveDuckDns();
+      }}
+    >
+      <input
+        class="input mono"
+        bind:value={duckDomain}
+        placeholder="yourname.duckdns.org (free at duckdns.org)"
+      />
+      <div class="row">
+        <input
+          class="input mono grow"
+          type="password"
+          bind:value={duckToken}
+          placeholder="DuckDNS token"
+        />
+        <button class="btn btn-primary" type="submit" disabled={savingDuck}>
+          {savingDuck ? "Saving" : "Save DuckDNS"}
+        </button>
+      </div>
+    </form>
+  </div>
+
+  <div class="card stack">
+    <div class="row-between">
+      <div class="stack-xs">
+        <div class="row">
+          <h2 class="section-title">Option 2: Tailscale direct peer-to-peer</h2>
+          <span class="badge badge-blue">Best behind CGNAT</span>
+        </div>
+        <span class="muted tiny">
+          Works even if your ISP blocks port forwarding, with direct NZ-to-NZ ping and zero playit.gg relay. Share this PC to friends in the free Tailscale app.
+        </span>
+      </div>
+      {#if overview?.tailscale_ip}
+        <span class="badge badge-green mono">{overview.tailscale_ip}</span>
+      {:else}
+        <button class="btn btn-sm" onclick={() => api.openUrl("https://tailscale.com/download/windows")}>
+          Get Tailscale
+        </button>
+      {/if}
+    </div>
   </div>
 
   <div class="card stack">
     <div class="stack-xs">
-      <h2 class="section-title">Internet tunnel (playit.gg)</h2>
-      <span class="muted tiny">Works behind CGNAT with no router changes. Save your tunnel address so it shows on the Dashboard.</span>
+      <h2 class="section-title">Option 3: Playit.gg tunnel (optional fallback)</h2>
+      <span class="muted tiny">Works behind CGNAT without friends installing anything. Save your tunnel address if you choose to use playit.</span>
     </div>
     <form
       class="row"
@@ -210,7 +285,7 @@
         bind:value={playitInput}
         placeholder="example.joinmc.link"
       />
-      <button class="btn btn-primary" type="submit">Save address</button>
+      <button class="btn" type="submit">Save address</button>
     </form>
   </div>
 

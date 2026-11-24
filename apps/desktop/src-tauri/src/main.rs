@@ -4,7 +4,7 @@ use blockhost_core::{
     autostart, backup,
     config::{self, ServerConfig, ServerSoftware},
     events::{LiveMetrics, StatusSnapshot},
-    hardware,
+    fabric, hardware,
     manager::Manager,
     network::{self, ActionResult, CgnatReport, LinkInfo, PingStats},
     paper::{self, Resolved, UpdateStatus},
@@ -53,6 +53,7 @@ struct UpdateSettingsArgs {
     backup_hours: Option<u32>,
     restart_hours: Option<u32>,
     perf_mode: Option<bool>,
+    aikar_flags: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -72,8 +73,21 @@ struct PlayersState {
 struct NetworkOverview {
     lan_ip: Option<String>,
     public_ip: Option<String>,
+    tailscale_ip: Option<String>,
     link: Option<LinkInfo>,
     cgnat: CgnatReport,
+}
+
+// ---------- Available Minecraft Versions ----------
+
+#[tauri::command]
+async fn list_mc_versions(software: ServerSoftware) -> Result<Vec<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || match software {
+        ServerSoftware::Paper => paper::list_versions(paper::DEFAULT_BASE).map_err(friendly_err),
+        ServerSoftware::Fabric => fabric::list_versions(fabric::DEFAULT_FABRIC_META).map_err(friendly_err),
+    })
+    .await
+    .map_err(|e| format!("Could not load Minecraft versions: {e}"))?
 }
 
 // ---------- Core Status & Lifecycle ----------
@@ -227,6 +241,22 @@ async fn player_admin_action(
             }
             format!("gamemode {mode} {username}")
         }
+        "tp" => {
+            let target = arg.unwrap_or_default().trim().to_string();
+            if !config::valid_username(&target) {
+                return Err("Select a valid target player to teleport to.".into());
+            }
+            format!("tp {username} {target}")
+        }
+        "heal" => format!("effect give {username} minecraft:instant_health 1 10 true"),
+        "feed" => format!("effect give {username} minecraft:saturation 1 10 true"),
+        "msg" => {
+            let text = arg.unwrap_or_default().trim().to_string();
+            if text.is_empty() {
+                return Err("Type a message first.".into());
+            }
+            format!("tell {username} {text}")
+        }
         _ => return Err("Unknown admin action.".into()),
     };
     let core = state.core.clone();
@@ -309,6 +339,9 @@ fn update_settings(state: State<'_, AppState>, args: UpdateSettingsArgs) -> Resu
     }
     if let Some(pm) = args.perf_mode {
         cfg.perf_mode = pm;
+    }
+    if let Some(af) = args.aikar_flags {
+        cfg.aikar_flags = af;
     }
 
     cfg.save(&dir).map_err(friendly_err)?;
@@ -447,6 +480,82 @@ async fn create_new_world(
     .map_err(|e| format!("Could not create new world: {e}"))?
 }
 
+#[tauri::command]
+async fn import_world_zip(state: State<'_, AppState>, server_name: String) -> Result<Option<String>, String> {
+    if state.core.is_running(&server_name) {
+        return Err("Stop the server first before uploading a world.".into());
+    }
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose a Minecraft world .zip file")
+            .add_filter("World archive", &["zip"])
+            .pick_file();
+        let Some(zip_path) = picked else {
+            return Ok(None);
+        };
+        let dir = paths::server_dir(&server_name);
+        let keep = ServerConfig::load(&dir).map(|c| c.backup_keep).unwrap_or(10);
+        let moved = world::import_world_zip(&dir, &server_name, &zip_path, keep).map_err(friendly_err)?;
+        core.emit_status(Some(&server_name));
+        Ok(Some(format!(
+            "World uploaded and ready! Your previous world was kept safely in {}",
+            moved.display()
+        )))
+    })
+    .await
+    .map_err(|e| format!("World upload failed: {e}"))?
+}
+
+#[tauri::command]
+async fn export_world_zip(server_name: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("Export world as .zip")
+            .set_file_name(format!("{server_name}-world.zip"))
+            .add_filter("World archive", &["zip"])
+            .save_file();
+        let Some(dest) = picked else {
+            return Ok(None);
+        };
+        let dir = paths::server_dir(&server_name);
+        let saved = world::export_world_zip(&dir, &dest).map_err(friendly_err)?;
+        Ok(Some(format!("Exported world to {}", saved.display())))
+    })
+    .await
+    .map_err(|e| format!("World export failed: {e}"))?
+}
+
+#[tauri::command]
+async fn import_local_addon(server_name: String) -> Result<Option<String>, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("Choose a Minecraft mod or plugin .jar file")
+            .add_filter("Minecraft JAR", &["jar"])
+            .pick_files();
+        let Some(files) = picked else {
+            return Ok(None);
+        };
+        if files.is_empty() {
+            return Ok(None);
+        }
+        let dir = paths::server_dir(&server_name);
+        let cfg = ServerConfig::load(&dir).map_err(friendly_err)?;
+        let mut added = Vec::new();
+        for f in files {
+            let name = plugins::import_local_jar(&dir, cfg.software, &f).map_err(friendly_err)?;
+            added.push(name);
+        }
+        Ok(Some(format!(
+            "Added {} file(s): {}. Restart the server to load them.",
+            added.len(),
+            added.join(", ")
+        )))
+    })
+    .await
+    .map_err(|e| format!("Could not add .jar file: {e}"))?
+}
+
 // ---------- Mods & Plugins (Paper Plugins / Fabric Mods) ----------
 
 #[tauri::command]
@@ -523,18 +632,72 @@ async fn get_network_overview() -> Result<NetworkOverview, String> {
     tauri::async_runtime::spawn_blocking(|| {
         let lan_ip = network::detect_lan_ip().map(|ip| ip.to_string());
         let public_ip = network::detect_public_ip();
+        let tailscale_ip = network::detect_tailscale_ip();
         let link = network::get_link_info();
         let wan_ip = network::upnp_external_ip().ok();
         let cgnat = network::evaluate_cgnat(wan_ip.as_deref(), public_ip.as_deref());
         NetworkOverview {
             lan_ip,
             public_ip,
+            tailscale_ip,
             link,
             cgnat,
         }
     })
     .await
     .map_err(|e| format!("Network check failed: {e}"))
+}
+
+#[tauri::command]
+async fn save_duckdns(
+    state: State<'_, AppState>,
+    server_name: String,
+    domain: String,
+    token: String,
+) -> Result<String, String> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = paths::server_dir(&server_name);
+        let mut cfg = ServerConfig::load(&dir).map_err(friendly_err)?;
+        if domain.trim().is_empty() {
+            cfg.duckdns_domain = None;
+            cfg.duckdns_token = None;
+            cfg.save(&dir).map_err(friendly_err)?;
+            core.emit_status(Some(&server_name));
+            return Ok("Cleared DuckDNS domain.".into());
+        }
+        let host = network::update_duckdns(&domain, &token).map_err(friendly_err)?;
+        cfg.duckdns_domain = Some(host.clone());
+        cfg.duckdns_token = Some(token.trim().to_string());
+        cfg.save(&dir).map_err(friendly_err)?;
+        core.emit_status(Some(&server_name));
+        Ok(format!("DuckDNS active: {host}"))
+    })
+    .await
+    .map_err(|e| format!("DuckDNS setup failed: {e}"))?
+}
+
+#[tauri::command]
+fn open_url(url: String) -> Result<(), String> {
+    let trimmed = url.trim();
+    if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
+        return Err("Only http:// and https:// links can be opened.".into());
+    }
+    #[cfg(windows)]
+    {
+        let _ = std::process::Command::new("cmd")
+            .args(["/C", "start", "", trimmed])
+            .spawn();
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = std::process::Command::new("open").arg(trimmed).spawn();
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        let _ = std::process::Command::new("xdg-open").arg(trimmed).spawn();
+    }
+    Ok(())
 }
 
 #[tauri::command]
@@ -622,6 +785,7 @@ fn main() {
     let app = tauri::Builder::default()
         .manage(AppState { core })
         .invoke_handler(tauri::generate_handler![
+            list_mc_versions,
             get_status,
             get_live_metrics,
             get_logs,
@@ -645,16 +809,21 @@ fn main() {
             get_game_rules,
             update_game_rule,
             create_new_world,
+            import_world_zip,
+            export_world_zip,
             list_addons,
             search_addons,
             resolve_addon,
             install_addon,
+            import_local_addon,
             remove_addon,
             get_network_overview,
             ping_target,
             setup_port_forward,
             remove_port_forward,
+            save_duckdns,
             open_folder,
+            open_url,
         ])
         .setup(move |app| {
             let open_item = MenuItem::with_id(app, "open", "Open BlockHost", true, None::<&str>)?;

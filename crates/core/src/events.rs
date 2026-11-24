@@ -1,6 +1,6 @@
 //! Typed events emitted by BlockHost core for UI shells (Tauri, CLI, service monitors).
 
-use crate::config::ServerSoftware;
+use crate::{config::ServerSoftware, crash::CrashDiagnosis};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,12 +81,16 @@ pub struct StatusSnapshot {
     pub backup_hours: Option<u32>,
     pub restart_hours: Option<u32>,
     pub perf_mode: Option<bool>,
+    pub aikar_flags: bool,
+    pub duckdns_domain: Option<String>,
+    pub tailscale_ip: Option<String>,
     pub autostart_enabled: bool,
     pub lan_ip: Option<String>,
     pub world_size_bytes: u64,
     pub running: Option<String>,
     pub stopping: bool,
     pub uptime_secs: Option<u64>,
+    pub last_crash: Option<CrashDiagnosis>,
     pub setup: SetupSummary,
     pub tunnel: TunnelSummary,
     pub backups: Vec<BackupEntry>,
@@ -99,4 +103,6 @@ pub struct LiveMetrics {
     pub online_players: Vec<String>,
     pub tps_text: Option<String>,
     pub uptime_secs: Option<u64>,
+    pub process_ram_mb: Option<u64>,
+    pub process_cpu_pct: Option<f32>,
 }

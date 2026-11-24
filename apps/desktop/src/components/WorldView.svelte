@@ -59,12 +59,57 @@
       busy = false;
     }
   }
+
+  async function uploadWorld() {
+    if (!serverName) return;
+    busy = true;
+    try {
+      const msg = await api.importWorldZip(serverName);
+      if (msg) {
+        onNotify(msg);
+        await refresh();
+      }
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function exportWorld() {
+    if (!serverName) return;
+    busy = true;
+    try {
+      const msg = await api.exportWorldZip(serverName);
+      if (msg) onNotify(msg);
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <div class="stack">
-  <div class="stack-xs">
-    <h1 class="page-title">World and rules</h1>
-    <p class="muted">Adjust gameplay settings or generate a fresh world safely.</p>
+  <div class="row-between">
+    <div class="stack-xs">
+      <h1 class="page-title">World and rules</h1>
+      <p class="muted">Upload a world zip, export your save, adjust rules, or start fresh safely.</p>
+    </div>
+
+    <div class="row">
+      <button
+        class="btn btn-primary"
+        disabled={busy || isRunning}
+        title={isRunning ? "Stop the server before uploading a world" : "Import a zipped Minecraft world"}
+        onclick={uploadWorld}
+      >
+        Upload world (.zip)
+      </button>
+      <button class="btn" disabled={busy} onclick={exportWorld}>
+        Export world (.zip)
+      </button>
+    </div>
   </div>
 
   {#if rules}

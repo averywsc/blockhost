@@ -20,3 +20,4 @@ serde_json.workspace = true
 tokio.workspace = true
 blockhost-core = { path = "../../../crates/core" }
 tauri = { version = "2", features = ["tray-icon", "image-png"] }
+rfd = { version = "0.15", default-features = false, features = ["common-controls-v6", "gtk3"] }

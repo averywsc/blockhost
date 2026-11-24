@@ -3,6 +3,7 @@
 
 use crate::{
     autostart, backup, config,
+    crash::{self, CrashDiagnosis},
     events::{
         BackupEntry, CoreEvent, HardwareSummary, LiveMetrics, SetupSummary, StatusSnapshot, TunnelSummary,
     },
@@ -13,7 +14,7 @@ use std::{
     collections::VecDeque,
     path::Path,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{channel, Sender},
         Arc, Mutex,
     },
@@ -51,6 +52,7 @@ struct Running {
     rcon_port: u16,
     rcon_password: String,
     started_at: Instant,
+    child_pid: Arc<AtomicU32>,
     shutdown: Arc<AtomicBool>,
     force_kill: Arc<AtomicBool>,
     tx: Sender<String>,
@@ -62,6 +64,7 @@ struct Inner {
     running: Mutex<Option<Running>>,
     setup: Mutex<SetupState>,
     tunnel: Mutex<TunnelInfo>,
+    last_crash: Mutex<Option<CrashDiagnosis>>,
     events: broadcast::Sender<CoreEvent>,
 }
 
@@ -105,6 +108,7 @@ impl Manager {
             running: Mutex::new(None),
             setup: Mutex::new(SetupState::default()),
             tunnel: Mutex::new(TunnelInfo::default()),
+            last_crash: Mutex::new(None),
             events,
         }))
     }
@@ -176,7 +180,7 @@ impl Manager {
             .map(|r| (r.rcon_port, r.rcon_password.clone()))
     }
 
-    /// Query live players and TPS via RCON if the server is running.
+    /// Query live players, TPS, and process RAM/CPU if the server is running.
     pub fn live_metrics(&self, name: &str) -> LiveMetrics {
         let info = self
             .0
@@ -190,16 +194,31 @@ impl Manager {
                     r.rcon_port,
                     r.rcon_password.clone(),
                     r.started_at.elapsed().as_secs(),
+                    r.child_pid.load(Ordering::SeqCst),
                 )
             });
-        let Some((port, pw, uptime)) = info else {
+        let Some((port, pw, uptime, pid_num)) = info else {
             return LiveMetrics {
                 reachable: false,
                 players_text: None,
                 online_players: Vec::new(),
                 tps_text: None,
                 uptime_secs: None,
+                process_ram_mb: None,
+                process_cpu_pct: None,
             };
+        };
+        let (process_ram_mb, process_cpu_pct) = if pid_num > 0 {
+            let mut sys = System::new();
+            let pid = Pid::from_u32(pid_num);
+            sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+            if let Some(p) = sys.process(pid) {
+                (Some(p.memory() / (1024 * 1024)), Some(p.cpu_usage()))
+            } else {
+                (None, None)
+            }
+        } else {
+            (None, None)
         };
         let list = rcon::send_command(port, &pw, "list").ok();
         let reachable = list.is_some();
@@ -222,6 +241,8 @@ impl Manager {
             online_players,
             tps_text,
             uptime_secs: Some(uptime),
+            process_ram_mb,
+            process_cpu_pct,
         }
     }
 
@@ -289,12 +310,16 @@ impl Manager {
             backup_hours: cfg.as_ref().map(|c| c.backup_hours),
             restart_hours: cfg.as_ref().map(|c| c.restart_hours),
             perf_mode: cfg.as_ref().map(|c| c.perf_mode),
+            aikar_flags: cfg.as_ref().is_some_and(|c| c.aikar_flags),
+            duckdns_domain: cfg.as_ref().and_then(|c| c.duckdns_domain.clone()),
+            tailscale_ip: network::detect_tailscale_ip(),
             autostart_enabled: autostart::is_enabled(),
             lan_ip: network::detect_lan_ip().map(|ip| ip.to_string()),
             world_size_bytes,
             running: running_name,
             stopping,
             uptime_secs,
+            last_crash: self.0.last_crash.lock().unwrap().clone(),
             setup: SetupSummary {
                 state: s.state,
                 message: s.message,
@@ -404,6 +429,7 @@ impl Manager {
         acquire_pid_lock(&dir)?;
 
         let use_tunnel = use_tunnel_override.unwrap_or(cfg.tunnel);
+        let child_pid = Arc::new(AtomicU32::new(0));
         let shutdown = Arc::new(AtomicBool::new(false));
         let force_kill = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
@@ -412,12 +438,14 @@ impl Manager {
             rcon_port: cfg.rcon_port,
             rcon_password: cfg.rcon_password.clone(),
             started_at: Instant::now(),
+            child_pid: child_pid.clone(),
             shutdown: shutdown.clone(),
             force_kill: force_kill.clone(),
             tx: tx.clone(),
         });
         drop(running);
         *self.0.tunnel.lock().unwrap() = TunnelInfo::default();
+        *self.0.last_crash.lock().unwrap() = None;
         self.emit_status(Some(name));
 
         let me = self.clone();
@@ -429,6 +457,14 @@ impl Manager {
                 "[blockhost] starting {name} ({} MB, port {})",
                 cfg.heap_mb, cfg.port
             ));
+
+            // Keep DuckDNS hostname synced on start if configured (zero-playit NZ direct ping).
+            if let (Some(dom), Some(tok)) = (cfg.duckdns_domain.as_deref(), cfg.duckdns_token.as_deref()) {
+                match network::update_duckdns(dom, tok) {
+                    Ok(host) => me.log(&format!("[blockhost] DuckDNS updated: {host}")),
+                    Err(e) => me.log(&format!("[blockhost] DuckDNS update skipped: {e:#}")),
+                }
+            }
 
             // Pre-start world backup (matching panel.ps1 Run-Server).
             if let Ok(z) = backup::create(&dir, &name, cfg.backup_keep) {
@@ -485,17 +521,42 @@ impl Manager {
                     .then(|| Duration::from_secs(u64::from(cfg.restart_hours) * 3600)),
                 ..supervisor::Policy::default()
             };
-            let res = supervisor::supervise_with_force(
-                || Ok(server::java_command(&java_bin, &dir, cfg.heap_mb)),
+            let res = supervisor::supervise_full(
+                || {
+                    Ok(server::java_command_with_flags(
+                        &java_bin,
+                        &dir,
+                        cfg.heap_mb,
+                        cfg.aikar_flags,
+                    ))
+                },
                 &policy,
                 &shutdown,
                 &force_kill,
+                &child_pid,
                 &rx,
                 &mut |l| me.log(l),
             );
             match res {
+                Ok(supervisor::Outcome::GaveUp { crashes }) => {
+                    me.log(&format!(
+                        "[blockhost] stopped after {crashes} crashes in 10 minutes"
+                    ));
+                    let (_, recent) = me.logs_since(0);
+                    *me.0.last_crash.lock().unwrap() = crash::analyze_logs(&recent).or_else(|| {
+                        Some(CrashDiagnosis {
+                            title: "Server kept crashing".into(),
+                            explanation: "The server crashed repeatedly so BlockHost paused restarts.".into(),
+                            suggestion: "Check the Console tab for the last error message.".into(),
+                        })
+                    });
+                }
                 Ok(o) => me.log(&format!("[blockhost] stopped: {o:?}")),
-                Err(e) => me.log(&format!("[blockhost] error: {e:#}")),
+                Err(e) => {
+                    me.log(&format!("[blockhost] error: {e:#}"));
+                    let (_, recent) = me.logs_since(0);
+                    *me.0.last_crash.lock().unwrap() = crash::analyze_logs(&recent);
+                }
             }
             shutdown.store(true, Ordering::SeqCst);
             if let Some(t) = tunnel_thread {

@@ -23,6 +23,7 @@
   let restartHours = $state(0);
   let tunnel = $state(false);
   let perfMode = $state(true);
+  let aikarFlags = $state(false);
   let motd = $state("");
   let whitelistOn = $state(true);
   let busy = $state(false);
@@ -42,6 +43,7 @@
     restartHours = status.restart_hours ?? 0;
     tunnel = status.tunnel.enabled;
     perfMode = status.perf_mode ?? true;
+    aikarFlags = status.aikar_flags;
     if (serverName) {
       api.getGameRules(serverName).then((r) => {
         motd = r.motd;
@@ -63,6 +65,7 @@
         backup_hours: backupHours,
         restart_hours: restartHours,
         perf_mode: perfMode,
+        aikar_flags: aikarFlags,
       });
       onNotify(
         isRunning
@@ -199,6 +202,14 @@
           <span class="muted tiny">Switch Windows power plan while running and restore on stop.</span>
         </div>
         <input type="checkbox" bind:checked={perfMode} />
+      </label>
+
+      <label class="subcard toggle-row">
+        <div class="stack-xs">
+          <strong>Aikar JVM performance flags</strong>
+          <span class="muted tiny">Tuned Java garbage collection for smoother ticks and fewer lag spikes.</span>
+        </div>
+        <input type="checkbox" bind:checked={aikarFlags} />
       </label>
     </div>
 

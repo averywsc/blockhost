@@ -2,9 +2,13 @@
 //! and disk usage inspection.
 
 use crate::{backup, config, hardware::Profile, paths, rcon};
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-use std::path::{Path, PathBuf};
+use std::{
+    fs::File,
+    io::Write,
+    path::{Path, PathBuf},
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct GameRules {
@@ -185,9 +189,13 @@ pub fn new_world(server_dir: &Path, server_name: &str, seed: &str, backup_keep: 
             .map(|d| d.as_secs())
             .unwrap_or(0),
     );
-    let dest = paths::root()
-        .join("old-worlds")
-        .join(format!("{server_name}-{stamp}"));
+    let old_root = paths::root().join("old-worlds");
+    let mut dest = old_root.join(format!("{server_name}-{stamp}"));
+    let mut suffix = 2u32;
+    while dest.exists() {
+        dest = old_root.join(format!("{server_name}-{stamp}-{suffix}"));
+        suffix += 1;
+    }
     std::fs::create_dir_all(&dest)?;
 
     for w in world_dirs {
@@ -241,6 +249,148 @@ pub fn dir_size(path: &Path) -> u64 {
         }
     }
     total
+}
+
+/// Export the active world folders (`world`, `world_nether`, `world_the_end`, etc.) to a user-chosen `.zip`.
+pub fn export_world_zip(server_dir: &Path, dest_zip: &Path) -> Result<PathBuf> {
+    let level = config::get_property(&server_dir.join("server.properties"), "level-name")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or_else(|| "world".to_string());
+    let worlds: Vec<String> = std::fs::read_dir(server_dir)
+        .map(|rd| {
+            rd.flatten()
+                .filter_map(|e| {
+                    let n = e.file_name().to_string_lossy().to_string();
+                    (e.path().is_dir() && n.starts_with(&level)).then_some(n)
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    if worlds.is_empty() {
+        bail!("No world exists yet. Start the server once to generate a world first.");
+    }
+    if let Some(parent) = dest_zip.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let part = dest_zip.with_extension("zip.part");
+    let mut zip = zip::ZipWriter::new(File::create(&part)?);
+    let opts = zip::write::SimpleFileOptions::default()
+        .compression_method(zip::CompressionMethod::Deflated)
+        .large_file(true);
+    for w in &worlds {
+        add_dir_to_zip(&mut zip, server_dir, Path::new(w), opts)?;
+    }
+    zip.finish()?.flush()?;
+    std::fs::rename(&part, dest_zip)?;
+    Ok(dest_zip.to_path_buf())
+}
+
+fn add_dir_to_zip(
+    zip: &mut zip::ZipWriter<File>,
+    base: &Path,
+    rel: &Path,
+    opts: zip::write::SimpleFileOptions,
+) -> Result<()> {
+    let full = base.join(rel);
+    let name = rel
+        .components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/");
+    if full.is_dir() {
+        for e in std::fs::read_dir(&full)? {
+            add_dir_to_zip(zip, base, &rel.join(e?.file_name()), opts)?;
+        }
+    } else if rel.file_name().is_some_and(|n| n != "session.lock") {
+        zip.start_file(name, opts)?;
+        std::io::copy(&mut File::open(&full)?, zip)?;
+    }
+    Ok(())
+}
+
+/// Safely import a world `.zip` (singleplayer save zip, custom map, or BlockHost backup) onto a stopped server:
+/// 1. Validates the zip contains a `level.dat` (at root, inside `world/`, or inside a single top-level folder).
+/// 2. Backs up existing worlds and moves them aside into `old-worlds/` (never deletes!).
+/// 3. Extracts cleanly into `server/world/` (and `world_nether` / `world_the_end` if present).
+pub fn import_world_zip(
+    server_dir: &Path,
+    server_name: &str,
+    zip_path: &Path,
+    backup_keep: usize,
+) -> Result<PathBuf> {
+    let file = File::open(zip_path).context("Could not open the selected world zip file.")?;
+    let mut archive = zip::ZipArchive::new(file).context("That file is not a valid .zip archive.")?;
+
+    let names: Vec<String> = (0..archive.len())
+        .filter_map(|i| archive.by_index(i).ok().map(|f| f.name().replace('\\', "/")))
+        .collect();
+
+    // Find `level.dat` to determine zip layout.
+    let level_dat = names
+        .iter()
+        .find(|n| {
+            let trimmed = n.trim_start_matches("./");
+            trimmed == "level.dat" || trimmed.ends_with("/level.dat")
+        })
+        .cloned()
+        .context("This zip does not look like a Minecraft world (no level.dat found inside).")?;
+
+    let level_parts: Vec<&str> = level_dat
+        .trim_start_matches("./")
+        .split('/')
+        .filter(|p| !p.is_empty())
+        .collect();
+
+    // Determine whether the zip already contains `world/`, `world_nether/` layout OR a single world folder/root.
+    let multi_world_layout = names
+        .iter()
+        .any(|n| n.starts_with("world_nether/") || n.starts_with("world_the_end/"))
+        || (level_parts.len() == 2 && level_parts[0] == "world");
+
+    let staging = server_dir.join(format!("import-staging-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&staging);
+    std::fs::create_dir_all(&staging)?;
+
+    // Safely extract all entries (ZipArchive::extract rejects path traversal `..`).
+    let extract_res = archive.extract(&staging);
+    if let Err(e) = extract_res {
+        let _ = std::fs::remove_dir_all(&staging);
+        return Err(e).context("Failed to unpack the world zip.");
+    }
+
+    // Back up and move current worlds aside (Section 6: never delete worlds!).
+    let moved_aside = new_world(server_dir, server_name, "", backup_keep)?;
+
+    if multi_world_layout {
+        for entry in std::fs::read_dir(&staging)? {
+            let e = entry?;
+            let fname = e.file_name();
+            let s = fname.to_string_lossy();
+            if e.path().is_dir() && s.starts_with("world") {
+                let target = server_dir.join(&fname);
+                if target.exists() {
+                    let _ = std::fs::remove_dir_all(&target);
+                }
+                std::fs::rename(e.path(), target)?;
+            }
+        }
+    } else if level_parts.len() == 1 {
+        // `level.dat` was at root of the zip -> staging itself IS the world folder.
+        std::fs::rename(&staging, server_dir.join("world"))?;
+        return Ok(moved_aside);
+    } else {
+        // `SomeMapName/level.dat` (or nested) -> move the folder containing `level.dat` to `server/world`.
+        let mut src_world = staging.clone();
+        for seg in &level_parts[..level_parts.len() - 1] {
+            src_world = src_world.join(seg);
+        }
+        std::fs::rename(src_world, server_dir.join("world"))?;
+    }
+
+    let _ = std::fs::remove_dir_all(&staging);
+    // Remove stale session.lock if the uploaded zip came from a running singleplayer save.
+    let _ = std::fs::remove_file(server_dir.join("world").join("session.lock"));
+    Ok(moved_aside)
 }
 
 #[cfg(test)]

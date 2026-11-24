@@ -206,6 +206,66 @@ pub fn detect_lan_ip() -> Option<Ipv4Addr> {
     }
 }
 
+/// Detect a local Tailscale IPv4 address (`100.64.0.0/10`) if Tailscale is installed & connected.
+/// Tailscale gives direct peer-to-peer NZ ping (~5-15 ms) even behind ISP CGNAT with zero playit relay.
+pub fn detect_tailscale_ip() -> Option<String> {
+    let mut cmd = Command::new("tailscale");
+    cmd.args(["ip", "-4"]);
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    text.lines()
+        .map(str::trim)
+        .find_map(|l| l.parse::<Ipv4Addr>().ok().map(|ip| ip.to_string()))
+}
+
+/// Normalize a DuckDNS subdomain (strips `.duckdns.org` if included) and validate it.
+pub fn normalize_duckdns_subdomain(raw: &str) -> Result<String> {
+    let sub = raw
+        .trim()
+        .to_ascii_lowercase()
+        .trim_end_matches(".duckdns.org")
+        .to_string();
+    if sub.is_empty()
+        || sub.len() > 63
+        || !sub
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+    {
+        bail!("DuckDNS name can only use letters, numbers, and dashes.");
+    }
+    Ok(sub)
+}
+
+/// Update a free DuckDNS hostname (`<subdomain>.duckdns.org`) to point to this PC's current public IP.
+pub fn update_duckdns(subdomain: &str, token: &str) -> Result<String> {
+    let sub = normalize_duckdns_subdomain(subdomain)?;
+    let token = token.trim();
+    if token.len() < 8 || !token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+        bail!("DuckDNS token does not look valid.");
+    }
+    let url = format!("https://www.duckdns.org/update?domains={sub}&token={token}&ip=");
+    let body = net::agent()
+        .get(&url)
+        .timeout(Duration::from_secs(10))
+        .call()
+        .context("Could not reach DuckDNS.")?
+        .into_string()
+        .unwrap_or_default();
+    if body.trim().eq_ignore_ascii_case("OK") {
+        Ok(format!("{sub}.duckdns.org"))
+    } else {
+        bail!("DuckDNS rejected the update (check your subdomain and token).");
+    }
+}
+
 /// Fetch our observed public IP via ipify.
 pub fn detect_public_ip() -> Option<String> {
     let text = net::agent()

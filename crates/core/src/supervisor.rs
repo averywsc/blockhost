@@ -3,7 +3,7 @@ use anyhow::Result;
 use std::{
     process::Command,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU32, Ordering},
         mpsc::{Receiver, RecvTimeoutError},
     },
     thread,
@@ -63,10 +63,25 @@ pub fn supervise(
 }
 
 pub fn supervise_with_force(
+    make_cmd: impl FnMut() -> Result<Command>,
+    policy: &Policy,
+    shutdown: &AtomicBool,
+    force_kill: &AtomicBool,
+    commands: &Receiver<String>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Outcome> {
+    let pid_slot = AtomicU32::new(0);
+    supervise_full(
+        make_cmd, policy, shutdown, force_kill, &pid_slot, commands, on_line,
+    )
+}
+
+pub fn supervise_full(
     mut make_cmd: impl FnMut() -> Result<Command>,
     policy: &Policy,
     shutdown: &AtomicBool,
     force_kill: &AtomicBool,
+    child_pid: &AtomicU32,
     commands: &Receiver<String>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Outcome> {
@@ -75,6 +90,7 @@ pub fn supervise_with_force(
 
     loop {
         let mut srv = Server::spawn(make_cmd()?)?;
+        child_pid.store(srv.id(), Ordering::SeqCst);
         let started = Instant::now();
 
         let mut scheduled = false;
@@ -82,18 +98,21 @@ pub fn supervise_with_force(
             if force_kill.load(Ordering::SeqCst) {
                 on_line("[blockhost] force stopping server process");
                 srv.kill();
+                child_pid.store(0, Ordering::SeqCst);
                 drain(&srv, on_line);
                 return Ok(Outcome::Shutdown);
             }
             if shutdown.load(Ordering::SeqCst) {
                 drain(&srv, on_line);
                 srv.stop(policy.stop_timeout)?;
+                child_pid.store(0, Ordering::SeqCst);
                 drain(&srv, on_line);
                 return Ok(Outcome::Shutdown);
             }
             if policy.max_uptime.is_some_and(|m| started.elapsed() >= m) {
                 on_line("[blockhost] scheduled restart");
                 let s = srv.stop(policy.stop_timeout)?;
+                child_pid.store(0, Ordering::SeqCst);
                 drain(&srv, on_line);
                 scheduled = true;
                 break s;
@@ -107,6 +126,7 @@ pub fn supervise_with_force(
                 Err(RecvTimeoutError::Disconnected) => thread::sleep(Duration::from_millis(50)),
             }
             if let Some(s) = srv.try_wait()? {
+                child_pid.store(0, Ordering::SeqCst);
                 // give reader threads a moment to flush the last lines
                 thread::sleep(Duration::from_millis(100));
                 drain(&srv, on_line);

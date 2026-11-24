@@ -404,5 +404,57 @@ fn paper_update_checks_sha256_backup_and_old_jar() {
     let ping = network::ping_host("127.0.0.1", 1).unwrap();
     assert!(ping.sent == 1);
 
+    // Export and re-import a nested singleplayer world zip safely (old world preserved!)
+    std::fs::create_dir_all(srv.join("world")).unwrap();
+    std::fs::write(srv.join("world/level.dat"), b"current-world").unwrap();
+    let exported = home.join("exported.zip");
+    world::export_world_zip(&srv, &exported).unwrap();
+    assert!(exported.exists());
+
+    // Build a nested singleplayer-style zip (MyCustomMap/level.dat)
+    let upload_zip = home.join("custom-map.zip");
+    {
+        let f = std::fs::File::create(&upload_zip).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        let opts = zip::write::SimpleFileOptions::default();
+        z.start_file("MyCustomMap/level.dat", opts).unwrap();
+        z.write_all(b"uploaded-adventure-map").unwrap();
+        z.finish().unwrap();
+    }
+    let aside = world::import_world_zip(&srv, "smp", &upload_zip, 10).unwrap();
+    assert_eq!(
+        std::fs::read(srv.join("world/level.dat")).unwrap(),
+        b"uploaded-adventure-map"
+    );
+    assert_eq!(
+        std::fs::read(aside.join("world/level.dat")).unwrap(),
+        b"current-world"
+    );
+
+    // DuckDNS normalization
+    assert_eq!(
+        network::normalize_duckdns_subdomain("Kiwi-SMP.duckdns.org").unwrap(),
+        "kiwi-smp"
+    );
+    assert!(network::normalize_duckdns_subdomain("bad name!").is_err());
+
+    // Local .jar import rejects non-zip, accepts valid jar
+    let bad_jar = home.join("fake.jar");
+    std::fs::write(&bad_jar, b"not a zip").unwrap();
+    assert!(plugins::import_local_jar(&srv, ServerSoftware::Fabric, &bad_jar).is_err());
+
+    let good_jar = home.join("coolmod-1.0.jar");
+    {
+        let f = std::fs::File::create(&good_jar).unwrap();
+        let mut z = zip::ZipWriter::new(f);
+        z.start_file("fabric.mod.json", zip::write::SimpleFileOptions::default())
+            .unwrap();
+        z.write_all(b"{}").unwrap();
+        z.finish().unwrap();
+    }
+    let added = plugins::import_local_jar(&srv, ServerSoftware::Fabric, &good_jar).unwrap();
+    assert_eq!(added, "coolmod-1.0.jar");
+    assert!(srv.join("mods/coolmod-1.0.jar").exists());
+
     std::fs::remove_dir_all(&home).unwrap();
 }

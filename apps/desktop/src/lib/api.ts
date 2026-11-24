@@ -33,6 +33,12 @@ export interface BackupEntry {
   size_bytes: number;
 }
 
+export interface CrashDiagnosis {
+  title: string;
+  explanation: string;
+  suggestion: string;
+}
+
 export interface StatusSnapshot {
   app_version: string;
   data_dir: string;
@@ -49,12 +55,16 @@ export interface StatusSnapshot {
   backup_hours: number | null;
   restart_hours: number | null;
   perf_mode: boolean | null;
+  aikar_flags: boolean;
+  duckdns_domain: string | null;
+  tailscale_ip: string | null;
   autostart_enabled: boolean;
   lan_ip: string | null;
   world_size_bytes: number;
   running: string | null;
   stopping: boolean;
   uptime_secs: number | null;
+  last_crash: CrashDiagnosis | null;
   setup: SetupSummary;
   tunnel: TunnelSummary;
   backups: BackupEntry[];
@@ -66,6 +76,8 @@ export interface LiveMetrics {
   online_players: string[];
   tps_text: string | null;
   uptime_secs: number | null;
+  process_ram_mb: number | null;
+  process_cpu_pct: number | null;
 }
 
 type boolOrFalse = boolean;
@@ -168,6 +180,7 @@ export interface CgnatReport {
 export interface NetworkOverview {
   lan_ip: string | null;
   public_ip: string | null;
+  tailscale_ip: string | null;
   link: LinkInfo | null;
   cgnat: CgnatReport;
 }
@@ -193,6 +206,8 @@ export function onCoreEvent(handler: (event: CoreEvent) => void): Promise<Unlist
 }
 
 export const api = {
+  listMcVersions: (software: ServerSoftware) =>
+    invoke<string[]>("list_mc_versions", { software }),
   getStatus: (selected?: string) =>
     invoke<StatusSnapshot>("get_status", { selected: selected ?? null }),
   getLiveMetrics: (serverName: string) =>
@@ -234,6 +249,7 @@ export const api = {
     backup_hours?: number;
     restart_hours?: number;
     perf_mode?: boolean;
+    aikar_flags?: boolean;
   }) => invoke<StatusSnapshot>("update_settings", { args }),
   setWhitelistEnabled: (serverName: string, enabled: boolean) =>
     invoke<void>("set_whitelist_enabled", { serverName, enabled }),
@@ -247,6 +263,10 @@ export const api = {
     invoke<GameRules>("update_game_rule", { serverName, rule, value }),
   createNewWorld: (serverName: string, seed: string) =>
     invoke<string>("create_new_world", { serverName, seed }),
+  importWorldZip: (serverName: string) =>
+    invoke<string | null>("import_world_zip", { serverName }),
+  exportWorldZip: (serverName: string) =>
+    invoke<string | null>("export_world_zip", { serverName }),
   listAddons: (serverName: string) => invoke<InstalledPlugin[]>("list_addons", { serverName }),
   searchAddons: (serverName: string, query: string) =>
     invoke<PluginHit[]>("search_addons", { serverName, query }),
@@ -254,6 +274,8 @@ export const api = {
     invoke<ResolvedPluginVersion>("resolve_addon", { serverName, projectId }),
   installAddon: (serverName: string, resolved: ResolvedPluginVersion) =>
     invoke<string>("install_addon", { serverName, resolved }),
+  importLocalAddon: (serverName: string) =>
+    invoke<string | null>("import_local_addon", { serverName }),
   removeAddon: (serverName: string, filename: string) =>
     invoke<void>("remove_addon", { serverName, filename }),
   getNetworkOverview: () => invoke<NetworkOverview>("get_network_overview"),
@@ -263,8 +285,11 @@ export const api = {
     invoke<[ActionResult, ActionResult]>("setup_port_forward", { serverName }),
   removePortForward: (serverName: string) =>
     invoke<ActionResult>("remove_port_forward", { serverName }),
+  saveDuckdns: (serverName: string, domain: string, token: string) =>
+    invoke<string>("save_duckdns", { serverName, domain, token }),
   openFolder: (serverName?: string, sub?: string) =>
     invoke<void>("open_folder", { serverName: serverName ?? null, sub: sub ?? null }),
+  openUrl: (url: string) => invoke<void>("open_url", { url }),
 };
 
 export function formatGb(mb: number): string {

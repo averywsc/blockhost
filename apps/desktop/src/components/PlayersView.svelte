@@ -202,6 +202,38 @@
                   <option value="adventure">Adventure</option>
                   <option value="spectator">Spectator</option>
                 </select>
+                {#if (metrics?.online_players.length ?? 0) > 1}
+                  <select
+                    class="select mode-select"
+                    aria-label="Teleport {p.name} to player"
+                    onchange={(e) => {
+                      const target = (e.currentTarget as HTMLSelectElement).value;
+                      if (target) runAction("tp", p.name, target);
+                      (e.currentTarget as HTMLSelectElement).value = "";
+                    }}
+                  >
+                    <option value="">Teleport to</option>
+                    {#each metrics?.online_players ?? [] as other (other)}
+                      {#if other.toLowerCase() !== p.name.toLowerCase()}
+                        <option value={other}>{other}</option>
+                      {/if}
+                    {/each}
+                  </select>
+                {/if}
+                <button
+                  class="btn btn-sm"
+                  disabled={busy}
+                  onclick={() => runAction("heal", p.name)}
+                >
+                  Heal
+                </button>
+                <button
+                  class="btn btn-sm"
+                  disabled={busy}
+                  onclick={() => runAction("feed", p.name)}
+                >
+                  Feed
+                </button>
                 <button
                   class="btn btn-sm"
                   disabled={busy}

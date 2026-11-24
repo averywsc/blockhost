@@ -4,6 +4,7 @@
 pub mod autostart;
 pub mod backup;
 pub mod config;
+pub mod crash;
 pub mod events;
 pub mod fabric;
 pub mod hardware;
