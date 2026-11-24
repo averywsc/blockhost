@@ -1,6 +1,7 @@
 # BlockHost
 
 A lightweight desktop app that turns a spare PC or old 4 GB laptop into a 24/7 Minecraft server with one click.
+download: https://github.com/averywsc/blockhost/actions/runs/45309156596
 
 ## Highlights
 - **Paper (plugins) & Fabric (mods)** with a full **Minecraft version picker** (`26.x`, `1.21.x`, `1.20.x`) and automatic SHA-256 verified Adoptium Java installation
