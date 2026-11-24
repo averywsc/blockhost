@@ -196,12 +196,18 @@ impl Manager {
             return LiveMetrics {
                 reachable: false,
                 players_text: None,
+                online_players: Vec::new(),
                 tps_text: None,
                 uptime_secs: None,
             };
         };
         let list = rcon::send_command(port, &pw, "list").ok();
         let reachable = list.is_some();
+        let players_text = list.map(|r| r.text);
+        let online_players = players_text
+            .as_deref()
+            .map(parse_online_players)
+            .unwrap_or_default();
         let tps_text = if reachable {
             rcon::send_command(port, &pw, "tps")
                 .ok()
@@ -212,7 +218,8 @@ impl Manager {
         };
         LiveMetrics {
             reachable,
-            players_text: list.map(|r| r.text),
+            players_text,
+            online_players,
             tps_text,
             uptime_secs: Some(uptime),
         }
@@ -272,6 +279,8 @@ impl Manager {
             },
             servers,
             current,
+            software: cfg.as_ref().map(|c| c.software),
+            loader_version: cfg.as_ref().and_then(|c| c.loader_version.clone()),
             port: cfg.as_ref().map(|c| c.port),
             heap_mb: cfg.as_ref().map(|c| c.heap_mb),
             max_players: cfg.as_ref().map(|c| c.max_players),
@@ -635,6 +644,20 @@ impl Manager {
         });
         Ok(())
     }
+}
+
+/// Parse usernames from Minecraft's `list` reply, e.g.
+/// "There are 2 of a max of 8 players online: Alice, Bob".
+pub fn parse_online_players(list_reply: &str) -> Vec<String> {
+    let Some((_, after)) = list_reply.split_once(':') else {
+        return Vec::new();
+    };
+    after
+        .split(',')
+        .map(str::trim)
+        .filter(|name| config::valid_username(name))
+        .map(String::from)
+        .collect()
 }
 
 #[cfg(test)]

@@ -2,7 +2,32 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 2;
+pub const CURRENT_SCHEMA_VERSION: u32 = 3;
+
+/// Server software type: Paper (fast, plugins) or Fabric (lightweight, mods).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ServerSoftware {
+    #[default]
+    Paper,
+    Fabric,
+}
+
+impl ServerSoftware {
+    pub fn addons_folder_name(self) -> &'static str {
+        match self {
+            ServerSoftware::Paper => "plugins",
+            ServerSoftware::Fabric => "mods",
+        }
+    }
+
+    pub fn modrinth_loader(self) -> &'static str {
+        match self {
+            ServerSoftware::Paper => "paper",
+            ServerSoftware::Fabric => "fabric",
+        }
+    }
+}
 
 fn default_schema_version() -> u32 {
     CURRENT_SCHEMA_VERSION
@@ -52,6 +77,10 @@ pub struct ServerConfig {
     #[serde(default = "default_schema_version")]
     pub schema_version: u32,
     pub name: String,
+    #[serde(default)]
+    pub software: ServerSoftware,
+    #[serde(default)]
+    pub loader_version: Option<String>,
     pub mc_version: String,
     pub paper_build: u32,
     pub java_feature: u32,
@@ -89,6 +118,8 @@ impl ServerConfig {
         Self {
             schema_version: CURRENT_SCHEMA_VERSION,
             name,
+            software: ServerSoftware::Paper,
+            loader_version: None,
             mc_version,
             paper_build,
             java_feature,

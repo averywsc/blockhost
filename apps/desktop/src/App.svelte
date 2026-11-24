@@ -1,246 +1,408 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import {
-    getStatus,
+    api,
     isTauriRuntime,
     onCoreEvent,
-    pingCore,
+    type LiveMetrics,
     type StatusSnapshot,
+    type UpdateStatus,
   } from "./lib/api";
+  import AddonsView from "./components/AddonsView.svelte";
+  import BackupsView from "./components/BackupsView.svelte";
+  import ConsoleView from "./components/ConsoleView.svelte";
+  import DashboardView from "./components/DashboardView.svelte";
+  import NetworkView from "./components/NetworkView.svelte";
+  import PlayersView from "./components/PlayersView.svelte";
+  import SettingsView from "./components/SettingsView.svelte";
+  import WizardView from "./components/WizardView.svelte";
+  import WorldView from "./components/WorldView.svelte";
+
+  type TabId =
+    | "dashboard"
+    | "console"
+    | "players"
+    | "world"
+    | "addons"
+    | "backups"
+    | "network"
+    | "settings"
+    | "wizard";
 
   let status = $state<StatusSnapshot | null>(null);
-  let events = $state<string[]>([]);
-  let error = $state<string | null>(null);
-  let busy = $state(false);
+  let metrics = $state<LiveMetrics | null>(null);
+  let updateInfo = $state<UpdateStatus | null>(null);
+  let logs = $state<string[]>([]);
+  let activeTab = $state<TabId>("dashboard");
+  let toast = $state<{ message: string; kind: "info" | "error" } | null>(null);
+  let toastTimer: ReturnType<typeof setTimeout> | undefined;
 
-  function formatGb(mb: number): string {
-    return `${(mb / 1024).toFixed(1)} GB`;
+  const hasServer = $derived(Boolean(status && status.servers.length > 0));
+  const isFabric = $derived(status?.software === "fabric");
+
+  function notify(message: string, kind: "info" | "error" = "info") {
+    toast = { message, kind };
+    clearTimeout(toastTimer);
+    toastTimer = setTimeout(() => {
+      toast = null;
+    }, 4500);
   }
 
-  async function sendPing() {
-    if (!isTauriRuntime()) {
-      events = [...events, "Preview mode: open inside BlockHost desktop to talk to Rust core."];
-      return;
-    }
-    busy = true;
-    error = null;
+  async function refreshUpdates() {
+    if (!status?.current || !isTauriRuntime()) return;
     try {
-      status = await pingCore();
-    } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
-    } finally {
-      busy = false;
+      updateInfo = await api.checkServerUpdates(status.current);
+    } catch {
+      // Quietly ignore offline update checks
     }
+  }
+
+  async function selectServer(name: string) {
+    if (!isTauriRuntime()) return;
+    status = await api.getStatus(name);
+    activeTab = "dashboard";
+    void refreshUpdates();
   }
 
   onMount(() => {
-    let unlisten: (() => void) | undefined;
-
     if (!isTauriRuntime()) {
-      events = ["Browser preview mode (Tauri backend not attached)."];
+      status = {
+        app_version: "0.1.0",
+        data_dir: "C:\\Users\\Preview\\AppData\\Local\\BlockHost",
+        hardware: {
+          ram_mb: 8192,
+          cores: 4,
+          tier: "standard",
+          recommended_heap_mb: 4915,
+          recommended_max_players: 16,
+          recommended_view_distance: 10,
+          recommended_simulation_distance: 8,
+          warning: null,
+        },
+        servers: ["kiwi-smp"],
+        current: "kiwi-smp",
+        software: "fabric",
+        loader_version: "0.16.10",
+        port: 25565,
+        heap_mb: 4096,
+        max_players: 12,
+        mc_version: "1.21.4",
+        paper_build: 0,
+        backup_hours: 6,
+        restart_hours: 0,
+        perf_mode: true,
+        autostart_enabled: false,
+        lan_ip: "192.168.1.42",
+        world_size_bytes: 184_000_000,
+        running: null,
+        stopping: false,
+        uptime_secs: null,
+        setup: { state: "", message: "", pct: 0 },
+        tunnel: {
+          enabled: true,
+          claim_url: null,
+          address: null,
+          saved_address: "kiwi-smp.joinmc.link",
+          error: null,
+        },
+        backups: [],
+      };
       return;
     }
+
+    let unlisten: (() => void) | undefined;
+    let poll: ReturnType<typeof setInterval> | undefined;
 
     void (async () => {
       try {
         unlisten = await onCoreEvent((ev) => {
           if (ev.kind === "status_changed") {
             status = ev;
-            events = [...events.slice(-19), `Status update received (v${ev.app_version})`];
+            if (ev.servers.length === 0) activeTab = "wizard";
           } else if (ev.kind === "log_line") {
-            events = [...events.slice(-19), ev.line];
+            logs = [...logs.slice(-999), ev.line];
+          } else if (ev.kind === "setup_progress" && status) {
+            status = {
+              ...status,
+              setup: { state: ev.state, message: ev.message, pct: ev.pct },
+            };
           } else if (ev.kind === "alert") {
-            events = [...events.slice(-19), `[${ev.level}] ${ev.message}`];
+            notify(ev.message, ev.level === "error" ? "error" : "info");
           }
         });
-        status = await getStatus();
+
+        const initial = await api.getStatus();
+        status = initial;
+        if (initial.servers.length === 0) {
+          activeTab = "wizard";
+        } else {
+          void refreshUpdates();
+        }
+
+        const initialLogs = await api.getLogs(0);
+        logs = initialLogs.lines;
+
+        poll = setInterval(async () => {
+          if (status?.running && status.current) {
+            try {
+              metrics = await api.getLiveMetrics(status.current);
+            } catch {
+              // ignore transient RCON startup polls
+            }
+          } else {
+            metrics = null;
+          }
+        }, 4000);
       } catch (e) {
-        error = e instanceof Error ? e.message : String(e);
+        notify(String(e), "error");
       }
     })();
 
     return () => {
       unlisten?.();
+      clearInterval(poll);
     };
   });
+
+  const navItems = $derived<{ id: TabId; label: string }[]>([
+    { id: "dashboard", label: "Dashboard" },
+    { id: "console", label: "Console" },
+    { id: "players", label: "Players" },
+    { id: "addons", label: isFabric ? "Mods" : "Plugins" },
+    { id: "world", label: "World" },
+    { id: "backups", label: "Backups" },
+    { id: "network", label: "Network" },
+    { id: "settings", label: "Settings" },
+  ]);
 </script>
 
-<main class="shell">
-  <header class="hero">
-    <div>
-      <h1>BlockHost</h1>
-      <p class="subtitle">
-        One-click 24/7 Minecraft server host &mdash; M0 walking skeleton
-      </p>
-    </div>
-    <button class="primary" onclick={sendPing} disabled={busy}>
-      {busy ? "Checking..." : "Ping Core"}
-    </button>
-  </header>
-
-  {#if error}
-    <section class="alert" role="alert">
-      <strong>Something went wrong:</strong> {error}
-    </section>
-  {/if}
-
-  {#if status}
-    <section class="grid" aria-label="Detected hardware and server state">
-      <article class="card">
-        <h2>This PC</h2>
-        <dl>
-          <div><dt>Memory</dt><dd>{formatGb(status.hardware.ram_mb)}</dd></div>
-          <div><dt>CPU cores</dt><dd>{status.hardware.cores}</dd></div>
-          <div><dt>Recommended RAM</dt><dd>{formatGb(status.hardware.recommended_heap_mb)} ({status.hardware.tier})</dd></div>
-          <div><dt>Suggested players</dt><dd>Up to {status.hardware.recommended_max_players}</dd></div>
-        </dl>
-        {#if status.hardware.warning}
-          <p class="warn">{status.hardware.warning}</p>
-        {/if}
-      </article>
-
-      <article class="card">
-        <h2>Server Status</h2>
-        <dl>
-          <div><dt>State</dt><dd>{status.running ? `Running (${status.running})` : "Stopped"}</dd></div>
-          <div><dt>Servers found</dt><dd>{status.servers.length}</dd></div>
-          <div><dt>Data folder</dt><dd class="mono">{status.data_dir}</dd></div>
-        </dl>
-        <p class="hint">
-          Closing this window keeps BlockHost running quietly in the system tray to save RAM.
-        </p>
-      </article>
-    </section>
-  {/if}
-
-  <section class="card" aria-label="Live event stream">
-    <h2>Live Core Events</h2>
-    {#if events.length === 0}
-      <p class="muted">Click "Ping Core" to verify the Tauri command &rarr; live event loop.</p>
-    {:else}
-      <ul class="log-list">
-        {#each events as line, i (i)}
-          <li class="mono">{line}</li>
-        {/each}
-      </ul>
+{#if !status}
+  <div class="loading">
+    <span class="muted">Starting BlockHost</span>
+  </div>
+{:else if !hasServer || activeTab === "wizard"}
+  <div class="wizard-shell">
+    {#if hasServer}
+      <div class="wizard-top">
+        <button class="btn btn-sm" onclick={() => (activeTab = "dashboard")}>Back to server</button>
+      </div>
     {/if}
-  </section>
-</main>
+    <WizardView
+      {status}
+      onNotify={notify}
+      onDone={() => {
+        activeTab = "dashboard";
+        void refreshUpdates();
+      }}
+    />
+  </div>
+{:else}
+  <div class="layout">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="logo" aria-hidden="true"></div>
+        <div class="stack-xs">
+          <strong class="brand-name">BlockHost</strong>
+          <span class="muted tiny">
+            {status.running ? "Server online" : "Server stopped"}
+          </span>
+        </div>
+      </div>
+
+      {#if status.servers.length > 1}
+        <select
+          class="select"
+          value={status.current ?? ""}
+          aria-label="Select server"
+          onchange={(e) => selectServer((e.currentTarget as HTMLSelectElement).value)}
+        >
+          {#each status.servers as name (name)}
+            <option value={name}>{name}</option>
+          {/each}
+        </select>
+      {/if}
+
+      <nav class="nav" aria-label="Main navigation">
+        {#each navItems as item (item.id)}
+          <button
+            class="nav-item"
+            class:active={activeTab === item.id}
+            onclick={() => (activeTab = item.id)}
+          >
+            {item.label}
+          </button>
+        {/each}
+      </nav>
+
+      <div class="sidebar-footer">
+        <button class="btn btn-sm full" onclick={() => (activeTab = "wizard")}>
+          New server
+        </button>
+      </div>
+    </aside>
+
+    <main class="content">
+      {#if activeTab === "dashboard"}
+        <DashboardView
+          {status}
+          {metrics}
+          {updateInfo}
+          onNotify={notify}
+          onNavigate={(t) => (activeTab = t as TabId)}
+        />
+      {:else if activeTab === "console"}
+        <ConsoleView {status} {logs} onNotify={notify} />
+      {:else if activeTab === "players"}
+        <PlayersView {status} {metrics} onNotify={notify} />
+      {:else if activeTab === "addons"}
+        <AddonsView {status} onNotify={notify} />
+      {:else if activeTab === "world"}
+        <WorldView {status} onNotify={notify} />
+      {:else if activeTab === "backups"}
+        <BackupsView {status} onNotify={notify} />
+      {:else if activeTab === "network"}
+        <NetworkView {status} onNotify={notify} />
+      {:else if activeTab === "settings"}
+        <SettingsView
+          {status}
+          {updateInfo}
+          onNotify={notify}
+          onRefreshUpdates={refreshUpdates}
+        />
+      {/if}
+    </main>
+  </div>
+{/if}
+
+{#if toast}
+  <div
+    class="toast {toast.kind === 'error' ? 'toast-error' : 'toast-info'}"
+    role="status"
+    aria-live="polite"
+  >
+    {toast.message}
+  </div>
+{/if}
 
 <style>
-  .shell {
-    max-width: 920px;
-    margin: 0 auto;
-    padding: 28px 24px 40px;
+  .loading {
+    height: 100%;
+    display: grid;
+    place-items: center;
+  }
+
+  .wizard-shell {
+    padding: 24px;
+  }
+
+  .wizard-top {
+    max-width: 680px;
+    margin: 0 auto 12px;
+  }
+
+  .layout {
+    display: grid;
+    grid-template-columns: 210px 1fr;
+    height: 100%;
+  }
+
+  .sidebar {
+    background: var(--sidebar);
+    padding: 20px 14px;
     display: flex;
     flex-direction: column;
-    gap: 20px;
+    gap: 18px;
   }
 
-  .hero {
+  .brand {
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 16px;
+    gap: 11px;
+    padding: 4px 6px;
   }
 
-  h1 {
-    margin: 0;
-    font-size: 1.75rem;
-    letter-spacing: -0.02em;
-  }
-
-  h2 {
-    margin: 0 0 12px;
-    font-size: 1rem;
-  }
-
-  .subtitle {
-    margin: 4px 0 0;
-    color: var(--muted);
-  }
-
-  .primary {
-    border: none;
-    border-radius: 10px;
-    background: var(--accent);
-    color: var(--accent-text);
-    font-weight: 600;
-    padding: 10px 18px;
-  }
-
-  .primary:hover:not(:disabled) {
-    background: var(--accent-hover);
-  }
-
-  .primary:disabled {
-    opacity: 0.6;
-    cursor: default;
-  }
-
-  .grid {
-    display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
-    gap: 16px;
-  }
-
-  .card {
-    background: var(--surface);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    padding: 18px 20px;
-  }
-
-  dl {
-    margin: 0;
-    display: grid;
-    gap: 8px;
-  }
-
-  dl > div {
-    display: flex;
-    justify-content: space-between;
-    gap: 12px;
-  }
-
-  dt {
-    color: var(--muted);
-  }
-
-  dd {
-    margin: 0;
-    font-weight: 600;
-    text-align: right;
-  }
-
-  .mono {
-    font-family: ui-monospace, "Cascadia Code", Consolas, monospace;
-    font-size: 0.85rem;
-    word-break: break-all;
-  }
-
-  .warn,
-  .alert {
-    margin: 12px 0 0;
-    padding: 10px 12px;
+  .logo {
+    width: 30px;
+    height: 30px;
     border-radius: 8px;
-    background: var(--warn-bg);
-    color: var(--warn-text);
-    font-size: 0.9rem;
+    background: linear-gradient(180deg, #4ab256 0%, #4ab256 42%, #78563c 42%, #78563c 100%);
+    flex-shrink: 0;
   }
 
-  .hint,
-  .muted {
-    margin: 12px 0 0;
-    color: var(--muted);
-    font-size: 0.9rem;
+  .brand-name {
+    font-size: 15px;
+    letter-spacing: -0.01em;
   }
 
-  .log-list {
-    margin: 0;
-    padding-left: 18px;
+  .stack-xs {
+    display: flex;
+    flex-direction: column;
+    gap: 1px;
+  }
+
+  .tiny {
+    font-size: 12px;
+  }
+
+  .nav {
     display: flex;
     flex-direction: column;
     gap: 4px;
+    flex: 1;
+  }
+
+  .nav-item {
+    text-align: left;
+    padding: 10px 14px;
+    border-radius: var(--radius-sm);
+    font-weight: 550;
+    color: var(--muted);
+  }
+
+  .nav-item:hover {
+    background: var(--surface-hover);
+    color: var(--text);
+  }
+
+  .nav-item.active {
+    background: var(--surface);
+    color: var(--text);
+    font-weight: 650;
+    box-shadow: var(--shadow);
+  }
+
+  .sidebar-footer {
+    padding-top: 8px;
+  }
+
+  .full {
+    width: 100%;
+  }
+
+  .content {
+    overflow-y: auto;
+    padding: 26px 30px 40px;
+  }
+
+  .toast {
+    position: fixed;
+    right: 22px;
+    bottom: 22px;
+    max-width: 420px;
+    padding: 12px 16px;
+    border-radius: var(--radius-sm);
+    font-weight: 550;
+    box-shadow: var(--shadow-lg);
+    z-index: 80;
+  }
+
+  .toast-info {
+    background: var(--surface);
+    color: var(--text);
+  }
+
+  .toast-error {
+    background: var(--danger);
+    color: #ffffff;
   }
 </style>

@@ -5,6 +5,7 @@ pub mod autostart;
 pub mod backup;
 pub mod config;
 pub mod events;
+pub mod fabric;
 pub mod hardware;
 pub mod java;
 pub mod manager;

@@ -151,6 +151,11 @@ fn setup(args: &[String]) -> Result<()> {
     setup_mod::create_server(
         &setup_mod::Options {
             name: name.clone(),
+            software: if args.iter().any(|a| a == "--fabric") {
+                config::ServerSoftware::Fabric
+            } else {
+                config::ServerSoftware::Paper
+            },
             version: flag(args, "--version"),
             port: flag(args, "--port")
                 .map(|p| p.parse())

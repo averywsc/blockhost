@@ -1,8 +1,9 @@
-//! Modrinth plugin search, verified installation, and removal.
-//! Enforces Section 6 safety rules: Paper + MC version facets, `https://cdn.modrinth.com/`
+//! Modrinth plugin & mod search, verified installation, and removal.
+//! Supports both Paper plugins (`plugins/`) and Fabric mods (`mods/`).
+//! Enforces Section 6 safety rules: loader + MC version facets, `https://cdn.modrinth.com/`
 //! URL allow-list, safe `.jar` filename validation, and SHA-512 verification.
 
-use crate::net;
+use crate::{config::ServerSoftware, net};
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -79,7 +80,7 @@ fn percent_encode(input: &str) -> String {
     out
 }
 
-/// Validate a plugin jar filename (`^[A-Za-z0-9_.+\- ]+\.jar$`, no path separators).
+/// Validate a plugin/mod jar filename (`^[A-Za-z0-9_.+\- ]+\.jar$`, no path separators).
 pub fn valid_jar_name(name: &str) -> bool {
     if !name.ends_with(".jar") || name.len() <= 4 || name.len() > 160 {
         return false;
@@ -91,13 +92,24 @@ pub fn valid_jar_name(name: &str) -> bool {
         .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'+' | b'-' | b' '))
 }
 
-/// Search Modrinth for Paper plugins compatible with `mc_version`.
-pub fn search(base_url: &str, query: &str, mc_version: &str, limit: usize) -> Result<Vec<PluginHit>> {
+pub fn addons_dir(server_dir: &Path, software: ServerSoftware) -> PathBuf {
+    server_dir.join(software.addons_folder_name())
+}
+
+/// Search Modrinth for plugins (Paper) or mods (Fabric) compatible with `mc_version`.
+pub fn search_for_software(
+    base_url: &str,
+    software: ServerSoftware,
+    query: &str,
+    mc_version: &str,
+    limit: usize,
+) -> Result<Vec<PluginHit>> {
     let query = query.trim();
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    let facets = format!(r#"[["categories:paper"],["versions:{mc_version}"]]"#);
+    let loader = software.modrinth_loader();
+    let facets = format!(r#"[["categories:{loader}"],["versions:{mc_version}"]]"#);
     let url = format!(
         "{}/search?query={}&limit={}&facets={}",
         base_url.trim_end_matches('/'),
@@ -105,30 +117,41 @@ pub fn search(base_url: &str, query: &str, mc_version: &str, limit: usize) -> Re
         limit.clamp(1, 20),
         percent_encode(&facets)
     );
-    let resp: SearchResponse = net::get_json(&url).context("Modrinth plugin search failed")?;
+    let resp: SearchResponse = net::get_json(&url).context("Modrinth search failed")?;
     Ok(resp.hits)
 }
 
-/// Resolve the latest Paper-compatible download for a Modrinth project.
-pub fn resolve_version(base_url: &str, project_id: &str, mc_version: &str) -> Result<ResolvedPluginVersion> {
+/// Convenience wrapper for Paper plugin search.
+pub fn search(base_url: &str, query: &str, mc_version: &str, limit: usize) -> Result<Vec<PluginHit>> {
+    search_for_software(base_url, ServerSoftware::Paper, query, mc_version, limit)
+}
+
+/// Resolve the latest compatible download for a Modrinth project.
+pub fn resolve_version_for_software(
+    base_url: &str,
+    software: ServerSoftware,
+    project_id: &str,
+    mc_version: &str,
+) -> Result<ResolvedPluginVersion> {
     if !project_id
         .bytes()
         .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
     {
         bail!("invalid Modrinth project id");
     }
-    let loaders = percent_encode(r#"["paper"]"#);
+    let loader = software.modrinth_loader();
+    let loaders = percent_encode(&format!(r#"["{loader}"]"#));
     let game_versions = percent_encode(&format!(r#"["{mc_version}"]"#));
     let url = format!(
         "{}/project/{project_id}/version?loaders={loaders}&game_versions={game_versions}",
         base_url.trim_end_matches('/')
     );
     let versions: Vec<ModrinthVersion> =
-        net::get_json(&url).context("could not fetch plugin versions from Modrinth")?;
+        net::get_json(&url).context("could not fetch versions from Modrinth")?;
     let v = versions
         .into_iter()
         .next()
-        .with_context(|| format!("no Paper download available for Minecraft {mc_version}"))?;
+        .with_context(|| format!("no {loader} download available for Minecraft {mc_version}"))?;
     let file = v
         .files
         .iter()
@@ -143,7 +166,7 @@ pub fn resolve_version(base_url: &str, project_id: &str, mc_version: &str) -> Re
         .to_string();
     if !valid_jar_name(&safe_name) {
         bail!(
-            "plugin filename '{}' did not look safe, so it was skipped",
+            "download filename '{}' did not look safe, so it was skipped",
             file.filename
         );
     }
@@ -151,7 +174,7 @@ pub fn resolve_version(base_url: &str, project_id: &str, mc_version: &str) -> Re
     let url_ok = file.url.starts_with(ALLOWED_CDN_PREFIX)
         || (base_url != DEFAULT_MODRINTH_BASE && file.url.starts_with(base_url.trim_end_matches('/')));
     if !url_ok {
-        bail!("plugin download URL is not on the allowed Modrinth CDN, so it was skipped");
+        bail!("download URL is not on the allowed Modrinth CDN, so it was skipped");
     }
 
     let required_dependency_count = v
@@ -169,25 +192,38 @@ pub fn resolve_version(base_url: &str, project_id: &str, mc_version: &str) -> Re
     })
 }
 
-/// Download and SHA-512 verify a resolved plugin into `<server_dir>/plugins/<filename>`.
+pub fn resolve_version(base_url: &str, project_id: &str, mc_version: &str) -> Result<ResolvedPluginVersion> {
+    resolve_version_for_software(base_url, ServerSoftware::Paper, project_id, mc_version)
+}
+
+/// Download and SHA-512 verify a resolved addon into `plugins/` (Paper) or `mods/` (Fabric).
+pub fn install_addon(
+    server_dir: &Path,
+    software: ServerSoftware,
+    resolved: &ResolvedPluginVersion,
+    progress: &mut dyn FnMut(u64, Option<u64>),
+) -> Result<PathBuf> {
+    if !valid_jar_name(&resolved.filename) {
+        bail!("unsafe filename");
+    }
+    let dir = addons_dir(server_dir, software);
+    std::fs::create_dir_all(&dir)?;
+    let dest = dir.join(&resolved.filename);
+    net::download_sha512(&resolved.url, &dest, resolved.sha512.as_deref(), progress)?;
+    Ok(dest)
+}
+
 pub fn install_plugin(
     server_dir: &Path,
     resolved: &ResolvedPluginVersion,
     progress: &mut dyn FnMut(u64, Option<u64>),
 ) -> Result<PathBuf> {
-    if !valid_jar_name(&resolved.filename) {
-        bail!("unsafe plugin filename");
-    }
-    let plugins_dir = server_dir.join("plugins");
-    std::fs::create_dir_all(&plugins_dir)?;
-    let dest = plugins_dir.join(&resolved.filename);
-    net::download_sha512(&resolved.url, &dest, resolved.sha512.as_deref(), progress)?;
-    Ok(dest)
+    install_addon(server_dir, ServerSoftware::Paper, resolved, progress)
 }
 
-pub fn list_installed(server_dir: &Path) -> Vec<InstalledPlugin> {
-    let plugins_dir = server_dir.join("plugins");
-    let mut out: Vec<InstalledPlugin> = std::fs::read_dir(plugins_dir)
+pub fn list_addons(server_dir: &Path, software: ServerSoftware) -> Vec<InstalledPlugin> {
+    let dir = addons_dir(server_dir, software);
+    let mut out: Vec<InstalledPlugin> = std::fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
                 .filter_map(|e| {
@@ -208,16 +244,24 @@ pub fn list_installed(server_dir: &Path) -> Vec<InstalledPlugin> {
     out
 }
 
-pub fn remove_plugin(server_dir: &Path, filename: &str) -> Result<()> {
+pub fn list_installed(server_dir: &Path) -> Vec<InstalledPlugin> {
+    list_addons(server_dir, ServerSoftware::Paper)
+}
+
+pub fn remove_addon(server_dir: &Path, software: ServerSoftware, filename: &str) -> Result<()> {
     if !valid_jar_name(filename) {
-        bail!("invalid plugin filename");
+        bail!("invalid filename");
     }
-    let path = server_dir.join("plugins").join(filename);
+    let path = addons_dir(server_dir, software).join(filename);
     if !path.exists() {
-        bail!("plugin '{filename}' not found");
+        bail!("'{filename}' not found");
     }
     std::fs::remove_file(path)?;
     Ok(())
+}
+
+pub fn remove_plugin(server_dir: &Path, filename: &str) -> Result<()> {
+    remove_addon(server_dir, ServerSoftware::Paper, filename)
 }
 
 #[cfg(test)]
@@ -227,7 +271,7 @@ mod tests {
     #[test]
     fn validates_jar_filenames_safely() {
         assert!(valid_jar_name("Chunky-1.4.0.jar"));
-        assert!(valid_jar_name("WorldEdit 7.3+1.jar"));
+        assert!(valid_jar_name("fabric-api-0.115.0+1.21.4.jar"));
         assert!(!valid_jar_name("../evil.jar"));
         assert!(!valid_jar_name("bad/path.jar"));
         assert!(!valid_jar_name("script.exe"));

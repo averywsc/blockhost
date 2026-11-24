@@ -1,7 +1,7 @@
 //! Live upstream API contract smoke tests (Paper Fill v3, Adoptium JRE metadata, Modrinth v2).
 //! Run with: cargo test -p blockhost-core --test live_api -- --ignored
 
-use blockhost_core::{java, net, paper};
+use blockhost_core::{fabric, java, net, paper};
 
 #[test]
 #[ignore = "hits live PaperMC Fill v3 API"]
@@ -41,4 +41,17 @@ fn live_modrinth_v2_search_contract() {
         !hits.is_empty(),
         "expected at least one Paper plugin hit for chunky"
     );
+}
+
+#[test]
+#[ignore = "hits live Fabric Meta v2 API"]
+fn live_fabric_meta_v2_contract() {
+    let resolved = fabric::resolve(None).expect("Fabric Meta v2 resolve failed");
+    assert!(!resolved.mc_version.is_empty());
+    assert!(!resolved.mc_version.contains('-'));
+    assert!(!resolved.loader_version.is_empty());
+    assert!(!resolved.installer_version.is_empty());
+    assert!(resolved
+        .url
+        .starts_with("https://meta.fabricmc.net/v2/versions/loader/"));
 }

@@ -2,7 +2,9 @@
 //! and `tests/suite-network.ps1`. Uses in-process fake TCP RCON and HTTP servers (Paper, Modrinth, Mojang)
 //! so the entire suite runs deterministically on Windows, Linux, and macOS with zero external dependencies.
 
-use blockhost_core::{backup, config, network, paper, players, plugins, rcon, world};
+use blockhost_core::{
+    backup, config, config::ServerSoftware, manager, network, paper, players, plugins, rcon, world,
+};
 use sha2::{Digest, Sha256, Sha512};
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -242,6 +244,59 @@ fn modrinth_plugin_search_sha512_install_and_remove() {
 
     plugins::remove_plugin(&srv, "Chunky-1.4.0.jar").unwrap();
     assert!(plugins::list_installed(&srv).is_empty());
+
+    std::fs::remove_dir_all(&srv).unwrap();
+}
+
+#[test]
+fn fabric_mods_install_into_mods_dir_and_online_players_parse() {
+    let jar_bytes = b"PK-fake-fabric-mod".to_vec();
+    let sha512 = hex(&Sha512::digest(&jar_bytes));
+    let url_holder = Arc::new(std::sync::Mutex::new(String::new()));
+    let url_for_handler = url_holder.clone();
+    let jar_clone = jar_bytes.clone();
+    let sha_clone = sha512.clone();
+
+    let base = start_fake_http(move |path| {
+        let base_url = url_for_handler.lock().unwrap().clone();
+        if path.starts_with("/search?") {
+            assert!(path.contains("categories%3Afabric"), "{path}");
+            assert!(path.contains("versions%3A1.21.4"), "{path}");
+            let body = r#"{"hits":[{"title":"Lithium","project_id":"lith","description":"Fast server optimization mod","downloads":9999,"author":"jellysquid3"}]}"#;
+            (200, "application/json", body.as_bytes().to_vec())
+        } else if path.starts_with("/project/lith/version?") {
+            assert!(path.contains("fabric"), "{path}");
+            let body = format!(
+                r#"[{{"version_number":"0.14.0","files":[{{"primary":true,"filename":"lithium-fabric-0.14.0.jar","url":"{base_url}/cdn/lithium-fabric-0.14.0.jar","hashes":{{"sha512":"{sha_clone}"}}}}],"dependencies":[]}}]"#
+            );
+            (200, "application/json", body.into_bytes())
+        } else if path == "/cdn/lithium-fabric-0.14.0.jar" {
+            (200, "application/java-archive", jar_clone.clone())
+        } else {
+            (404, "application/json", b"{}".to_vec())
+        }
+    });
+    *url_holder.lock().unwrap() = base.clone();
+
+    let hits = plugins::search_for_software(&base, ServerSoftware::Fabric, "lithium", "1.21.4", 6).unwrap();
+    assert_eq!(hits.len(), 1);
+    let ver = plugins::resolve_version_for_software(&base, ServerSoftware::Fabric, "lith", "1.21.4").unwrap();
+
+    let srv = std::env::temp_dir().join(format!("bh-fabric-mods-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&srv);
+    std::fs::create_dir_all(&srv).unwrap();
+
+    let dest = plugins::install_addon(&srv, ServerSoftware::Fabric, &ver, &mut |_, _| {}).unwrap();
+    assert!(dest.starts_with(srv.join("mods")));
+    assert_eq!(plugins::list_addons(&srv, ServerSoftware::Fabric).len(), 1);
+    plugins::remove_addon(&srv, ServerSoftware::Fabric, "lithium-fabric-0.14.0.jar").unwrap();
+    assert!(plugins::list_addons(&srv, ServerSoftware::Fabric).is_empty());
+
+    assert_eq!(
+        manager::parse_online_players("There are 2 of a max of 8 players online: Alice, Bob_1"),
+        vec!["Alice", "Bob_1"]
+    );
+    assert!(manager::parse_online_players("There are 0 of a max of 8 players online:").is_empty());
 
     std::fs::remove_dir_all(&srv).unwrap();
 }

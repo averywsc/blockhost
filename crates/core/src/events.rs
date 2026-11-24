@@ -1,5 +1,6 @@
 //! Typed events emitted by BlockHost core for UI shells (Tauri, CLI, service monitors).
 
+use crate::config::ServerSoftware;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -70,6 +71,8 @@ pub struct StatusSnapshot {
     pub hardware: HardwareSummary,
     pub servers: Vec<String>,
     pub current: Option<String>,
+    pub software: Option<ServerSoftware>,
+    pub loader_version: Option<String>,
     pub port: Option<u16>,
     pub heap_mb: Option<u64>,
     pub max_players: Option<u32>,
@@ -93,6 +96,7 @@ pub struct StatusSnapshot {
 pub struct LiveMetrics {
     pub reachable: bool,
     pub players_text: Option<String>,
+    pub online_players: Vec<String>,
     pub tps_text: Option<String>,
     pub uptime_secs: Option<u64>,
 }

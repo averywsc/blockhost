@@ -1,13 +1,16 @@
-//! Create a ready-to-run server: pick a profile, fetch Java + Paper, write safe defaults,
-//! and optionally add the owner's Minecraft username as the initial admin.
+//! Create a ready-to-run server (Paper for plugins or Fabric for mods):
+//! pick a hardware profile, fetch Java + server jar, write safe defaults,
+//! and optionally add the owner's Minecraft username as initial admin.
 
-use crate::{config, hardware, java, net, paper, paths, players};
+use crate::{config, fabric, hardware, java, net, paper, paths, players};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub name: String,
+    #[serde(default)]
+    pub software: config::ServerSoftware,
     pub version: Option<String>,
     pub port: u16,
     pub eula: bool,
@@ -55,32 +58,69 @@ pub fn create_server(
     let max_heap = hw.total_ram_mb.saturating_sub(1024).max(1024);
     let heap_mb = o.heap_mb.unwrap_or(profile.heap_mb).clamp(1024, max_heap);
 
-    step("Finding the newest stable Paper build...");
-    let r = paper::resolve(o.version.as_deref())?;
-    step(&format!(
-        "Paper {} (build {}) needs Java {}",
-        r.mc_version, r.build, r.java_feature
-    ));
+    let cfg = match o.software {
+        config::ServerSoftware::Paper => {
+            step("Finding the newest stable Paper build...");
+            let r = paper::resolve(o.version.as_deref())?;
+            step(&format!(
+                "Paper {} (build {}) needs Java {}",
+                r.mc_version, r.build, r.java_feature
+            ));
 
-    step("Getting Java (one-time download)...");
-    java::ensure_java(r.java_feature, &mut |d, t| progress("java", d, t))?;
+            step("Getting Java (one-time download)...");
+            java::ensure_java(r.java_feature, &mut |d, t| progress("java", d, t))?;
 
-    std::fs::create_dir_all(&dir)?;
-    step("Downloading the server...");
-    net::download(&r.url, &dir.join("server.jar"), Some(&r.sha256), &mut |d, t| {
-        progress("paper", d, t)
-    })?;
+            std::fs::create_dir_all(&dir)?;
+            std::fs::create_dir_all(dir.join("plugins"))?;
+            step("Downloading Paper server...");
+            net::download(&r.url, &dir.join("server.jar"), Some(&r.sha256), &mut |d, t| {
+                progress("paper", d, t)
+            })?;
 
-    let mut cfg = config::ServerConfig::new(
-        o.name.clone(),
-        r.mc_version,
-        r.build,
-        r.java_feature,
-        heap_mb,
-        o.port,
-        profile.max_players,
-    );
-    cfg.tunnel = o.tunnel;
+            let mut c = config::ServerConfig::new(
+                o.name.clone(),
+                r.mc_version,
+                r.build,
+                r.java_feature,
+                heap_mb,
+                o.port,
+                profile.max_players,
+            );
+            c.software = config::ServerSoftware::Paper;
+            c.tunnel = o.tunnel;
+            c
+        }
+        config::ServerSoftware::Fabric => {
+            step("Finding the newest stable Fabric mod loader...");
+            let r = fabric::resolve(o.version.as_deref())?;
+            step(&format!(
+                "Fabric {} (loader {}) needs Java {}",
+                r.mc_version, r.loader_version, r.java_feature
+            ));
+
+            step("Getting Java (one-time download)...");
+            java::ensure_java(r.java_feature, &mut |d, t| progress("java", d, t))?;
+
+            std::fs::create_dir_all(&dir)?;
+            std::fs::create_dir_all(dir.join("mods"))?;
+            step("Downloading Fabric server launcher...");
+            fabric::download_server_jar(&r, &dir.join("server.jar"), &mut |d, t| progress("fabric", d, t))?;
+
+            let mut c = config::ServerConfig::new(
+                o.name.clone(),
+                r.mc_version,
+                0,
+                r.java_feature,
+                heap_mb,
+                o.port,
+                profile.max_players,
+            );
+            c.software = config::ServerSoftware::Fabric;
+            c.loader_version = Some(r.loader_version);
+            c.tunnel = o.tunnel;
+            c
+        }
+    };
 
     config::write_eula(&dir, o.eula)?;
     config::apply_defaults(&dir, &cfg, profile.view_distance, profile.simulation_distance)?;
@@ -122,6 +162,7 @@ mod tests {
     fn eula_is_required() {
         let o = Options {
             name: "x".into(),
+            software: config::ServerSoftware::Paper,
             version: None,
             port: 25565,
             eula: false,
