@@ -1,0 +1,16 @@
+[package]
+name = "blockhost-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Headless CLI and service runner for BlockHost"
+
+[[bin]]
+name = "blockhost"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+ctrlc.workspace = true
+blockhost-core = { path = "../core" }

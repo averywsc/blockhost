@@ -1,0 +1,21 @@
+# Rust / Cargo
+/target/
+**/target/
+
+# Node / Frontend
+node_modules/
+apps/desktop/dist/
+apps/desktop/.svelte-kit/
+
+# OS & Editor
+.DS_Store
+Thumbs.db
+*.swp
+.vscode/
+.idea/
+
+# Local test / runtime data
+*.part
+*.lock
+.env
+.env.local
