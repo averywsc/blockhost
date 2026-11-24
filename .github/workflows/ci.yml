@@ -86,9 +86,9 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (desktop)
-        run: cargo clippy -p blockhost-desktop --all-targets -- -D warnings
-      - name: Build desktop shell
-        run: cargo build -p blockhost-desktop --release
+        run: cargo clippy -p blockhost-desktop --all-targets --features custom-protocol -- -D warnings
+      - name: Build desktop shell (embedded UI)
+        run: cargo build -p blockhost-desktop --release --features custom-protocol
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}

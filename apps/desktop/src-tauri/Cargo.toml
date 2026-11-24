@@ -6,6 +6,10 @@ license.workspace = true
 repository.workspace = true
 description = "BlockHost desktop app shell (Tauri v2)"
 
+[features]
+# Enables embedded production frontend assets (used by release builds & CI).
+custom-protocol = ["tauri/custom-protocol"]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
