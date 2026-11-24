@@ -1,14 +1,17 @@
 //! Shared state behind BlockHost UI shells (Tauri desktop app, CLI, service).
-//! Owns the running server, log ring buffer, setup progress, tunnel info, and live event stream.
+//! Owns the running server, log ring buffer, setup progress, tunnel info, RCON actions, and live event stream.
 
 use crate::{
-    backup, config,
-    events::{CoreEvent, HardwareSummary, SetupSummary, StatusSnapshot, TunnelSummary},
-    hardware, java, paths, power, server, setup, supervisor, tunnel,
+    autostart, backup, config,
+    events::{
+        BackupEntry, CoreEvent, HardwareSummary, LiveMetrics, SetupSummary, StatusSnapshot, TunnelSummary,
+    },
+    hardware, java, network, paths, players, power, rcon, server, setup, supervisor, tunnel, world,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::{
     collections::VecDeque,
+    path::Path,
     sync::{
         atomic::{AtomicBool, Ordering},
         mpsc::{channel, Sender},
@@ -17,6 +20,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+use sysinfo::{Pid, ProcessesToUpdate, System};
 use tokio::sync::broadcast;
 
 const MAX_LOG: usize = 3000;
@@ -44,7 +48,11 @@ struct TunnelInfo {
 
 struct Running {
     name: String,
+    rcon_port: u16,
+    rcon_password: String,
+    started_at: Instant,
     shutdown: Arc<AtomicBool>,
+    force_kill: Arc<AtomicBool>,
     tx: Sender<String>,
 }
 
@@ -64,6 +72,28 @@ impl Default for Manager {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Acquire a PID-aware server lockfile. If an old lockfile belongs to a dead PID (e.g. after power loss),
+/// automatically reclaim it so non-technical users are never stranded.
+fn acquire_pid_lock(dir: &Path) -> Result<()> {
+    let lock = dir.join("blockhost.lock");
+    if lock.exists() {
+        if let Ok(raw) = std::fs::read_to_string(&lock) {
+            if let Ok(pid_num) = raw.trim().parse::<u32>() {
+                let mut sys = System::new();
+                let pid = Pid::from_u32(pid_num);
+                sys.refresh_processes(ProcessesToUpdate::Some(&[pid]), true);
+                if sys.process(pid).is_some() {
+                    bail!("this server is already running (PID {pid_num})");
+                }
+            }
+        }
+        // Stale lock from a previous crash/power cut -> remove and reclaim.
+        let _ = std::fs::remove_file(&lock);
+    }
+    std::fs::write(&lock, std::process::id().to_string())?;
+    Ok(())
 }
 
 impl Manager {
@@ -126,6 +156,68 @@ impl Manager {
         v
     }
 
+    pub fn is_running(&self, name: &str) -> bool {
+        self.0
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|r| r.name == name)
+    }
+
+    /// Return `(rcon_port, rcon_password)` if `name` is currently running.
+    pub fn live_rcon(&self, name: &str) -> Option<(u16, String)> {
+        self.0
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|r| r.name == name)
+            .map(|r| (r.rcon_port, r.rcon_password.clone()))
+    }
+
+    /// Query live players and TPS via RCON if the server is running.
+    pub fn live_metrics(&self, name: &str) -> LiveMetrics {
+        let info = self
+            .0
+            .running
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|r| r.name == name)
+            .map(|r| {
+                (
+                    r.rcon_port,
+                    r.rcon_password.clone(),
+                    r.started_at.elapsed().as_secs(),
+                )
+            });
+        let Some((port, pw, uptime)) = info else {
+            return LiveMetrics {
+                reachable: false,
+                players_text: None,
+                tps_text: None,
+                uptime_secs: None,
+            };
+        };
+        let list = rcon::send_command(port, &pw, "list").ok();
+        let reachable = list.is_some();
+        let tps_text = if reachable {
+            rcon::send_command(port, &pw, "tps")
+                .ok()
+                .map(|r| r.text)
+                .filter(|t| !t.is_empty())
+        } else {
+            None
+        };
+        LiveMetrics {
+            reachable,
+            players_text: list.map(|r| r.text),
+            tps_text,
+            uptime_secs: Some(uptime),
+        }
+    }
+
     pub fn status(&self, selected: Option<&str>) -> StatusSnapshot {
         let servers = self.servers();
         let running = self.0.running.lock().unwrap();
@@ -133,6 +225,7 @@ impl Manager {
         let stopping = running
             .as_ref()
             .is_some_and(|r| r.shutdown.load(Ordering::SeqCst));
+        let uptime_secs = running.as_ref().map(|r| r.started_at.elapsed().as_secs());
         drop(running);
         let current = selected
             .map(String::from)
@@ -145,15 +238,25 @@ impl Manager {
         let cfg = current
             .as_ref()
             .and_then(|n| config::ServerConfig::load(&paths::server_dir(n)).ok());
-        let backups: Vec<String> = current
+        let world_size_bytes = current
+            .as_ref()
+            .map(|n| world::world_size_bytes(&paths::server_dir(n)))
+            .unwrap_or(0);
+        let backups: Vec<BackupEntry> = current
             .as_ref()
             .map(|n| {
                 backup::list(n)
                     .iter()
-                    .filter_map(|p| p.file_name().map(|f| f.to_string_lossy().to_string()))
+                    .filter_map(|p| {
+                        Some(BackupEntry {
+                            filename: p.file_name()?.to_string_lossy().to_string(),
+                            size_bytes: p.metadata().map(|m| m.len()).unwrap_or(0),
+                        })
+                    })
                     .collect()
             })
             .unwrap_or_default();
+
         StatusSnapshot {
             app_version: env!("CARGO_PKG_VERSION").to_string(),
             data_dir: paths::root().display().to_string(),
@@ -170,18 +273,29 @@ impl Manager {
             servers,
             current,
             port: cfg.as_ref().map(|c| c.port),
+            heap_mb: cfg.as_ref().map(|c| c.heap_mb),
+            max_players: cfg.as_ref().map(|c| c.max_players),
             mc_version: cfg.as_ref().map(|c| c.mc_version.clone()),
             paper_build: cfg.as_ref().map(|c| c.paper_build),
+            backup_hours: cfg.as_ref().map(|c| c.backup_hours),
+            restart_hours: cfg.as_ref().map(|c| c.restart_hours),
+            perf_mode: cfg.as_ref().map(|c| c.perf_mode),
+            autostart_enabled: autostart::is_enabled(),
+            lan_ip: network::detect_lan_ip().map(|ip| ip.to_string()),
+            world_size_bytes,
             running: running_name,
             stopping,
+            uptime_secs,
             setup: SetupSummary {
                 state: s.state,
                 message: s.message,
                 pct: s.pct,
             },
             tunnel: TunnelSummary {
+                enabled: cfg.as_ref().is_some_and(|c| c.tunnel),
                 claim_url: t.claim,
                 address: t.address,
+                saved_address: cfg.as_ref().and_then(|c| c.playit_address.clone()),
                 error: t.error,
             },
             backups,
@@ -263,7 +377,7 @@ impl Manager {
         Ok(())
     }
 
-    pub fn start(&self, name: &str, use_tunnel: bool) -> Result<()> {
+    pub fn start(&self, name: &str, use_tunnel_override: Option<bool>) -> Result<()> {
         if !setup::valid_name(name) {
             bail!("bad server name");
         }
@@ -275,23 +389,22 @@ impl Manager {
         let cfg = config::ServerConfig::load(&dir).context("server not found")?;
         let java_bin = java::find_java(&paths::java_dir(cfg.java_feature))
             .context("Java is missing - create the server again")?;
-        let lock = dir.join("blockhost.lock");
-        std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&lock)
-            .map_err(|_| {
-                anyhow!(
-                    "this server looks like it is already running (if it crashed, delete {})",
-                    lock.display()
-                )
-            })?;
 
+        // Ensure RCON is configured in server.properties before booting Paper.
+        config::apply_rcon_properties(&dir, &cfg)?;
+        acquire_pid_lock(&dir)?;
+
+        let use_tunnel = use_tunnel_override.unwrap_or(cfg.tunnel);
         let shutdown = Arc::new(AtomicBool::new(false));
+        let force_kill = Arc::new(AtomicBool::new(false));
         let (tx, rx) = channel();
         *running = Some(Running {
             name: name.to_string(),
+            rcon_port: cfg.rcon_port,
+            rcon_password: cfg.rcon_password.clone(),
+            started_at: Instant::now(),
             shutdown: shutdown.clone(),
+            force_kill: force_kill.clone(),
             tx: tx.clone(),
         });
         drop(running);
@@ -302,21 +415,30 @@ impl Manager {
         let name = name.to_string();
         thread::spawn(move || {
             let _awake = power::KeepAwake::start();
+            let _perf = power::PerfModeGuard::enter(cfg.perf_mode);
             me.log(&format!(
                 "[blockhost] starting {name} ({} MB, port {})",
                 cfg.heap_mb, cfg.port
             ));
-            backup::scheduled(
-                tx,
-                dir.clone(),
-                name.clone(),
-                Duration::from_secs(6 * 3600),
-                10,
-                shutdown.clone(),
-            );
+
+            // Pre-start world backup (matching panel.ps1 Run-Server).
+            if let Ok(z) = backup::create(&dir, &name, cfg.backup_keep) {
+                me.log(&format!("[blockhost] pre-start backup saved: {}", z.display()));
+            }
+
+            if cfg.backup_hours > 0 {
+                backup::scheduled(
+                    tx.clone(),
+                    dir.clone(),
+                    name.clone(),
+                    Duration::from_secs(u64::from(cfg.backup_hours) * 3600),
+                    cfg.backup_keep,
+                    shutdown.clone(),
+                );
+            }
 
             let tunnel_thread = use_tunnel.then(|| {
-                let (m, sd) = (me.clone(), shutdown.clone());
+                let (m, sd, srv_dir) = (me.clone(), shutdown.clone(), dir.clone());
                 thread::spawn(move || {
                     if let Err(e) = tunnel::ensure_agent(&mut |_, _| {}) {
                         m.0.tunnel.lock().unwrap().error = Some(format!("{e:#}"));
@@ -333,8 +455,12 @@ impl Manager {
                                 match ev {
                                     tunnel::Event::ClaimUrl(u) => t.claim = Some(u),
                                     tunnel::Event::Address(a) => {
-                                        t.address = Some(a);
+                                        t.address = Some(a.clone());
                                         t.claim = None;
+                                        if let Ok(mut c) = config::ServerConfig::load(&srv_dir) {
+                                            c.playit_address = Some(a);
+                                            let _ = c.save(&srv_dir);
+                                        }
                                     }
                                 }
                             }
@@ -346,13 +472,15 @@ impl Manager {
             });
 
             let policy = supervisor::Policy {
-                max_uptime: Some(Duration::from_secs(24 * 3600)),
+                max_uptime: (cfg.restart_hours > 0)
+                    .then(|| Duration::from_secs(u64::from(cfg.restart_hours) * 3600)),
                 ..supervisor::Policy::default()
             };
-            let res = supervisor::supervise(
+            let res = supervisor::supervise_with_force(
                 || Ok(server::java_command(&java_bin, &dir, cfg.heap_mb)),
                 &policy,
                 &shutdown,
+                &force_kill,
                 &rx,
                 &mut |l| me.log(l),
             );
@@ -371,9 +499,50 @@ impl Manager {
         Ok(())
     }
 
+    /// Request graceful stop, optionally warning online players for `warn_seconds` first.
+    pub fn stop_with_warning(&self, warn_seconds: u64) {
+        let info = self.0.running.lock().unwrap().as_ref().map(|r| {
+            (
+                r.rcon_port,
+                r.rcon_password.clone(),
+                r.shutdown.clone(),
+                r.tx.clone(),
+            )
+        });
+        let Some((port, pw, shutdown, tx)) = info else {
+            return;
+        };
+        if warn_seconds == 0 {
+            let _ = rcon::send_command(port, &pw, "save-all");
+            shutdown.store(true, Ordering::SeqCst);
+            self.emit_status(None);
+            return;
+        }
+        let me = self.clone();
+        thread::spawn(move || {
+            let msg = format!("say Server stopping in {warn_seconds} seconds!");
+            if rcon::send_command(port, &pw, &msg).is_err() {
+                let _ = tx.send(msg);
+            }
+            me.log(&format!(
+                "[blockhost] warned players; stopping in {warn_seconds} seconds..."
+            ));
+            thread::sleep(Duration::from_secs(warn_seconds));
+            let _ = rcon::send_command(port, &pw, "save-all");
+            shutdown.store(true, Ordering::SeqCst);
+            me.emit_status(None);
+        });
+    }
+
     pub fn stop(&self) {
+        self.stop_with_warning(0);
+    }
+
+    /// Force-kill a hung server process without waiting for save (caller MUST confirm with user first).
+    pub fn force_stop(&self) {
         if let Some(r) = self.0.running.lock().unwrap().as_ref() {
             r.shutdown.store(true, Ordering::SeqCst);
+            r.force_kill.store(true, Ordering::SeqCst);
         }
         self.emit_status(None);
     }
@@ -387,17 +556,43 @@ impl Manager {
         }
     }
 
-    pub fn command(&self, cmd: &str) -> Result<()> {
+    /// Execute a command on the live server (prefers RCON for structured reply; falls back to stdin).
+    pub fn command(&self, cmd: &str) -> Result<String> {
+        let cmd = cmd.trim().trim_start_matches('/');
+        if cmd.is_empty() {
+            bail!("empty command");
+        }
         if cmd.contains('\n') || cmd.contains('\r') {
             bail!("one command at a time");
         }
-        match self.0.running.lock().unwrap().as_ref() {
-            Some(r) => {
-                r.tx.send(cmd.to_string())
-                    .map_err(|_| anyhow!("server is not accepting commands"))
-            }
+        let (port, pw, tx) = match self.0.running.lock().unwrap().as_ref() {
+            Some(r) => (r.rcon_port, r.rcon_password.clone(), r.tx.clone()),
             None => bail!("start the server first"),
+        };
+        if let Ok(resp) = rcon::send_command(port, &pw, cmd) {
+            return Ok(resp.text);
         }
+        tx.send(cmd.to_string())
+            .map_err(|_| anyhow!("server is not accepting commands"))?;
+        Ok(String::new())
+    }
+
+    pub fn add_player(&self, server_name: &str, username: &str, admin: bool) -> Result<String> {
+        let dir = paths::server_dir(server_name);
+        let live = self.live_rcon(server_name);
+        let live_ref = live.as_ref().map(|(p, pw)| (*p, pw.as_str()));
+        let res = players::add_player(&dir, username, admin, live_ref, players::DEFAULT_MOJANG_BASE)?;
+        self.emit_status(Some(server_name));
+        Ok(res)
+    }
+
+    pub fn remove_player(&self, server_name: &str, username: &str, admin_only: bool) -> Result<String> {
+        let dir = paths::server_dir(server_name);
+        let live = self.live_rcon(server_name);
+        let live_ref = live.as_ref().map(|(p, pw)| (*p, pw.as_str()));
+        let res = players::remove_player(&dir, username, admin_only, live_ref)?;
+        self.emit_status(Some(server_name));
+        Ok(res)
     }
 
     pub fn backup_now(&self, name: &str) -> Result<()> {
@@ -405,6 +600,9 @@ impl Manager {
             bail!("bad server name");
         }
         let dir = paths::server_dir(name);
+        let keep = config::ServerConfig::load(&dir)
+            .map(|c| c.backup_keep)
+            .unwrap_or(10);
         let live = self
             .0
             .running
@@ -412,20 +610,26 @@ impl Manager {
             .unwrap()
             .as_ref()
             .filter(|r| r.name == name)
-            .map(|r| r.tx.clone());
+            .map(|r| (r.rcon_port, r.rcon_password.clone(), r.tx.clone()));
         let (me, name) = (self.clone(), name.to_string());
         thread::spawn(move || {
-            if let Some(tx) = &live {
-                let _ = tx.send("save-off".into());
-                let _ = tx.send("save-all flush".into());
-                thread::sleep(Duration::from_secs(15));
+            if let Some((port, pw, tx)) = &live {
+                if rcon::send_command(*port, pw, "save-off").is_ok() {
+                    let _ = rcon::send_command(*port, pw, "save-all flush");
+                } else {
+                    let _ = tx.send("save-off".into());
+                    let _ = tx.send("save-all flush".into());
+                }
+                thread::sleep(Duration::from_secs(8));
             }
-            match backup::create(&dir, &name, 10) {
+            match backup::create(&dir, &name, keep) {
                 Ok(p) => me.log(&format!("[blockhost] backup saved: {}", p.display())),
                 Err(e) => me.log(&format!("[blockhost] backup failed: {e:#}")),
             }
-            if let Some(tx) = &live {
-                let _ = tx.send("save-on".into());
+            if let Some((port, pw, tx)) = &live {
+                if rcon::send_command(*port, pw, "save-on").is_err() {
+                    let _ = tx.send("save-on".into());
+                }
             }
             me.emit_status(Some(&name));
         });
@@ -461,5 +665,20 @@ mod tests {
             }
             other => panic!("unexpected event: {other:?}"),
         }
+    }
+
+    #[test]
+    fn reclaims_stale_pid_lock() {
+        let dir = std::env::temp_dir().join(format!("bh-lock-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Write a bogus dead PID that cannot exist
+        std::fs::write(dir.join("blockhost.lock"), "99999999").unwrap();
+        acquire_pid_lock(&dir).expect("should reclaim stale lock");
+        assert_eq!(
+            std::fs::read_to_string(dir.join("blockhost.lock")).unwrap(),
+            std::process::id().to_string()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

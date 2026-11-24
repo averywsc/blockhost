@@ -1,7 +1,9 @@
-//! Stop the machine from sleeping while the server runs. This is what makes an
-//! old laptop a real 24/7 host (lid closed, screen off, still serving).
+//! Stop the machine from sleeping while the server runs, and optionally switch to
+//! Windows High Performance power plan (restoring the previous plan on exit).
 
 use anyhow::{bail, Result};
+
+const HIGH_PERFORMANCE_GUID: &str = "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c";
 
 /// Holds a "don't sleep" request for as long as it's alive.
 pub struct KeepAwake {
@@ -78,6 +80,104 @@ impl Drop for KeepAwake {
     }
 }
 
+/// Extract a power scheme GUID (`xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`) from `powercfg` output.
+pub fn parse_scheme_guid(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    if bytes.len() < 36 {
+        return None;
+    }
+    for i in 0..=bytes.len() - 36 {
+        let cand = &text[i..i + 36];
+        let b = cand.as_bytes();
+        let dashes_ok = b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-';
+        if !dashes_ok {
+            continue;
+        }
+        let hex_ok = b
+            .iter()
+            .enumerate()
+            .all(|(idx, &ch)| matches!(idx, 8 | 13 | 18 | 23) || ch.is_ascii_hexdigit());
+        if hex_ok {
+            return Some(cand.to_string());
+        }
+    }
+    None
+}
+
+/// RAII guard that activates Windows High Performance power plan (if available on the machine)
+/// and restores the user's previous plan on drop. Gracefully no-ops on Modern Standby laptops
+/// where the High Performance GUID is unavailable, or on non-Windows OSes.
+pub struct PerfModeGuard {
+    previous_guid: Option<String>,
+}
+
+impl PerfModeGuard {
+    pub fn enter(enabled: bool) -> Self {
+        if !enabled {
+            return Self { previous_guid: None };
+        }
+        Self {
+            previous_guid: enter_perf_mode(),
+        }
+    }
+
+    pub fn previous_guid(&self) -> Option<&str> {
+        self.previous_guid.as_deref()
+    }
+}
+
+impl Drop for PerfModeGuard {
+    fn drop(&mut self) {
+        if let Some(prev) = self.previous_guid.take() {
+            exit_perf_mode(&prev);
+        }
+    }
+}
+
+pub fn enter_perf_mode() -> Option<String> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let out = std::process::Command::new("powercfg")
+            .arg("/getactivescheme")
+            .creation_flags(0x0800_0000)
+            .output()
+            .ok()?;
+        let prev = parse_scheme_guid(&String::from_utf8_lossy(&out.stdout))?;
+        let st = std::process::Command::new("powercfg")
+            .args(["/setactive", HIGH_PERFORMANCE_GUID])
+            .creation_flags(0x0800_0000)
+            .status()
+            .ok()?;
+        if st.success() {
+            Some(prev)
+        } else {
+            // Modern Standby (S0ix) laptops often omit the High Performance scheme; degrade cleanly.
+            None
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = HIGH_PERFORMANCE_GUID;
+        None
+    }
+}
+
+pub fn exit_perf_mode(prev_guid: &str) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        let _ = std::process::Command::new("powercfg")
+            .args(["/setactive", prev_guid])
+            .creation_flags(0x0800_0000)
+            .status();
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = prev_guid;
+    }
+}
+
 /// The powercfg calls that make a Windows laptop keep running with the lid closed (plugged in).
 pub fn windows_power_commands() -> Vec<Vec<&'static str>> {
     vec![
@@ -95,7 +195,7 @@ pub fn windows_power_commands() -> Vec<Vec<&'static str>> {
     ]
 }
 
-/// Persistent Windows power settings (survive reboots). Run once from an admin-or-user shell.
+/// Persistent Windows power settings (survive reboots).
 pub fn apply_windows_power() -> Result<()> {
     if !cfg!(windows) {
         bail!(
@@ -103,7 +203,14 @@ pub fn apply_windows_power() -> Result<()> {
         );
     }
     for cmd in windows_power_commands() {
-        let status = std::process::Command::new(cmd[0]).args(&cmd[1..]).status()?;
+        let mut c = std::process::Command::new(cmd[0]);
+        c.args(&cmd[1..]);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            c.creation_flags(0x0800_0000);
+        }
+        let status = c.status()?;
         if !status.success() {
             bail!("`{}` failed", cmd.join(" "));
         }
@@ -118,8 +225,18 @@ mod tests {
     #[test]
     fn keep_awake_starts_and_drops_cleanly() {
         let k = KeepAwake::start();
-        let _ = k.active(); // must not panic on any OS
+        let _ = k.active();
         drop(k);
+    }
+
+    #[test]
+    fn parses_scheme_guid() {
+        assert_eq!(
+            parse_scheme_guid("Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)")
+                .as_deref(),
+            Some("381b4222-f694-41f0-9685-ff5bb260df2e")
+        );
+        assert_eq!(parse_scheme_guid("nothing here"), None);
     }
 
     #[test]

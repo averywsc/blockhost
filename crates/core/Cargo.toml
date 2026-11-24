@@ -18,3 +18,5 @@ sha2.workspace = true
 flate2.workspace = true
 tar.workspace = true
 zip.workspace = true
+getrandom.workspace = true
+igd-next.workspace = true

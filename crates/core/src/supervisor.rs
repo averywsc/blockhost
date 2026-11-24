@@ -52,9 +52,21 @@ pub enum Outcome {
 /// stop gracefully on `shutdown`, give up on crash loops. Server console lines
 /// go to `on_line`; anything arriving on `commands` is typed into the console.
 pub fn supervise(
+    make_cmd: impl FnMut() -> Result<Command>,
+    policy: &Policy,
+    shutdown: &AtomicBool,
+    commands: &Receiver<String>,
+    on_line: &mut dyn FnMut(&str),
+) -> Result<Outcome> {
+    let never_force = AtomicBool::new(false);
+    supervise_with_force(make_cmd, policy, shutdown, &never_force, commands, on_line)
+}
+
+pub fn supervise_with_force(
     mut make_cmd: impl FnMut() -> Result<Command>,
     policy: &Policy,
     shutdown: &AtomicBool,
+    force_kill: &AtomicBool,
     commands: &Receiver<String>,
     on_line: &mut dyn FnMut(&str),
 ) -> Result<Outcome> {
@@ -67,6 +79,12 @@ pub fn supervise(
 
         let mut scheduled = false;
         let status = loop {
+            if force_kill.load(Ordering::SeqCst) {
+                on_line("[blockhost] force stopping server process");
+                srv.kill();
+                drain(&srv, on_line);
+                return Ok(Outcome::Shutdown);
+            }
             if shutdown.load(Ordering::SeqCst) {
                 drain(&srv, on_line);
                 srv.stop(policy.stop_timeout)?;

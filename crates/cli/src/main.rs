@@ -157,6 +157,9 @@ fn setup(args: &[String]) -> Result<()> {
                 .transpose()?
                 .unwrap_or(25565),
             eula: true,
+            heap_mb: None,
+            tunnel: args.iter().any(|a| a == "--tunnel"),
+            owner_username: flag(args, "--owner"),
         },
         &mut |m| println!("{m}"),
         &mut |label, d, t| {

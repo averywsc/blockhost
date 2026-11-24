@@ -25,3 +25,5 @@ flate2 = "1"
 tar = "0.4"
 zip = { version = "2", default-features = false, features = ["deflate"] }
 ctrlc = { version = "3", features = ["termination"] }
+getrandom = "0.2"
+igd-next = "0.15"

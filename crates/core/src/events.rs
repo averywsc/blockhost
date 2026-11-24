@@ -50,9 +50,17 @@ pub struct SetupSummary {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TunnelSummary {
+    pub enabled: bool,
     pub claim_url: Option<String>,
     pub address: Option<String>,
+    pub saved_address: Option<String>,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BackupEntry {
+    pub filename: String,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -63,11 +71,28 @@ pub struct StatusSnapshot {
     pub servers: Vec<String>,
     pub current: Option<String>,
     pub port: Option<u16>,
+    pub heap_mb: Option<u64>,
+    pub max_players: Option<u32>,
     pub mc_version: Option<String>,
     pub paper_build: Option<u32>,
+    pub backup_hours: Option<u32>,
+    pub restart_hours: Option<u32>,
+    pub perf_mode: Option<bool>,
+    pub autostart_enabled: bool,
+    pub lan_ip: Option<String>,
+    pub world_size_bytes: u64,
     pub running: Option<String>,
     pub stopping: bool,
+    pub uptime_secs: Option<u64>,
     pub setup: SetupSummary,
     pub tunnel: TunnelSummary,
-    pub backups: Vec<String>,
+    pub backups: Vec<BackupEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiveMetrics {
+    pub reachable: bool,
+    pub players_text: Option<String>,
+    pub tps_text: Option<String>,
+    pub uptime_secs: Option<u64>,
 }

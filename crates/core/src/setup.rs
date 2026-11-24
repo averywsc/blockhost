@@ -1,13 +1,19 @@
-//! Create a ready-to-run server: pick a profile, fetch Java + Paper, write config.
+//! Create a ready-to-run server: pick a profile, fetch Java + Paper, write safe defaults,
+//! and optionally add the owner's Minecraft username as the initial admin.
 
-use crate::{config, hardware, java, net, paper, paths};
+use crate::{config, hardware, java, net, paper, paths, players};
 use anyhow::{bail, Result};
+use serde::{Deserialize, Serialize};
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Options {
     pub name: String,
     pub version: Option<String>,
     pub port: u16,
     pub eula: bool,
+    pub heap_mb: Option<u64>,
+    pub tunnel: bool,
+    pub owner_username: Option<String>,
 }
 
 pub fn valid_name(n: &str) -> bool {
@@ -29,11 +35,25 @@ pub fn create_server(
     if !o.eula {
         bail!("you need to accept the Minecraft EULA (https://aka.ms/MinecraftEULA)");
     }
+    if let Some(owner) = o
+        .owner_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if !config::valid_username(owner) {
+            bail!("'{owner}' is not a valid Minecraft username (3-16 letters, numbers, or _).");
+        }
+    }
+
     let dir = paths::server_dir(&o.name);
     if dir.join("blockhost.json").exists() {
         bail!("a server called {} already exists", o.name);
     }
-    let profile = hardware::recommend(&hardware::detect());
+    let hw = hardware::detect();
+    let profile = hardware::recommend(&hw);
+    let max_heap = hw.total_ram_mb.saturating_sub(1024).max(1024);
+    let heap_mb = o.heap_mb.unwrap_or(profile.heap_mb).clamp(1024, max_heap);
 
     step("Finding the newest stable Paper build...");
     let r = paper::resolve(o.version.as_deref())?;
@@ -51,19 +71,38 @@ pub fn create_server(
         progress("paper", d, t)
     })?;
 
-    let cfg = config::ServerConfig {
-        name: o.name.clone(),
-        mc_version: r.mc_version,
-        paper_build: r.build,
-        java_feature: r.java_feature,
-        heap_mb: profile.heap_mb,
-        port: o.port,
-        max_players: profile.max_players,
-    };
+    let mut cfg = config::ServerConfig::new(
+        o.name.clone(),
+        r.mc_version,
+        r.build,
+        r.java_feature,
+        heap_mb,
+        o.port,
+        profile.max_players,
+    );
+    cfg.tunnel = o.tunnel;
+
     config::write_eula(&dir, o.eula)?;
     config::apply_defaults(&dir, &cfg, profile.view_distance, profile.simulation_distance)?;
+    std::fs::write(dir.join("whitelist.json"), "[]\n")?;
+    std::fs::write(dir.join("ops.json"), "[]\n")?;
     cfg.save(&dir)?;
-    step("Server created. Whitelist is on, so add your players before they join.");
+
+    if let Some(owner) = o
+        .owner_username
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        step(&format!("Adding {owner} as server admin..."));
+        if let Err(e) = players::add_player(&dir, owner, true, None, players::DEFAULT_MOJANG_BASE) {
+            step(&format!(
+                "Note: could not add {owner} automatically ({e:#}); you can add them in Players."
+            ));
+        }
+    }
+
+    step("Server created. Whitelist is on, so only allowed players can join.");
     Ok(cfg)
 }
 
@@ -86,6 +125,9 @@ mod tests {
             version: None,
             port: 25565,
             eula: false,
+            heap_mb: None,
+            tunnel: false,
+            owner_username: None,
         };
         assert!(create_server(&o, &mut |_| {}, &mut |_, _, _| {}).is_err());
     }

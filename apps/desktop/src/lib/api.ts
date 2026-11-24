@@ -19,9 +19,16 @@ export interface SetupSummary {
 }
 
 export interface TunnelSummary {
+  enabled: boolean;
   claim_url: string | null;
   address: string | null;
+  saved_address: string | null;
   error: string | null;
+}
+
+export interface BackupEntry {
+  filename: string;
+  size_bytes: number;
 }
 
 export interface StatusSnapshot {
@@ -31,13 +38,22 @@ export interface StatusSnapshot {
   servers: string[];
   current: string | null;
   port: number | null;
+  heap_mb: number | null;
+  max_players: number | null;
   mc_version: string | null;
   paper_build: number | null;
+  backup_hours: number | null;
+  restart_hours: number | null;
+  perf_mode: boolean | null;
+  autostart_enabled: boolean;
+  lan_ip: string | null;
+  world_size_bytes: number;
   running: string | null;
   stopping: boolean;
+  uptime_secs: number | null;
   setup: SetupSummary;
   tunnel: TunnelSummary;
-  backups: string[];
+  backups: BackupEntry[];
 }
 
 export type CoreEvent =
