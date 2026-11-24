@@ -2,7 +2,7 @@ use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const CURRENT_SCHEMA_VERSION: u32 = 4;
+pub const CURRENT_SCHEMA_VERSION: u32 = 5;
 
 /// Server software type: Paper (fast, plugins) or Fabric (lightweight, mods).
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -100,6 +100,8 @@ pub struct ServerConfig {
     #[serde(default)]
     pub duckdns_token: Option<String>,
     #[serde(default)]
+    pub discord_webhook: Option<String>,
+    #[serde(default)]
     pub aikar_flags: bool,
     #[serde(default = "default_backup_hours")]
     pub backup_hours: u32,
@@ -138,6 +140,7 @@ impl ServerConfig {
             playit_address: None,
             duckdns_domain: None,
             duckdns_token: None,
+            discord_webhook: None,
             aikar_flags: false,
             backup_hours: default_backup_hours(),
             backup_keep: default_backup_keep(),

@@ -7,7 +7,8 @@ use crate::{
     events::{
         BackupEntry, CoreEvent, HardwareSummary, LiveMetrics, SetupSummary, StatusSnapshot, TunnelSummary,
     },
-    hardware, java, network, paths, players, power, rcon, server, setup, supervisor, tunnel, world,
+    hardware, java, network, notifications, paths, players, power, rcon, server, setup, supervisor, tunnel,
+    world,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use std::{
@@ -312,6 +313,7 @@ impl Manager {
             perf_mode: cfg.as_ref().map(|c| c.perf_mode),
             aikar_flags: cfg.as_ref().is_some_and(|c| c.aikar_flags),
             duckdns_domain: cfg.as_ref().and_then(|c| c.duckdns_domain.clone()),
+            discord_enabled: cfg.as_ref().is_some_and(|c| c.discord_webhook.is_some()),
             tailscale_ip: network::detect_tailscale_ip(),
             autostart_enabled: autostart::is_enabled(),
             lan_ip: network::detect_lan_ip().map(|ip| ip.to_string()),
@@ -466,6 +468,14 @@ impl Manager {
                 }
             }
 
+            // Notify Discord if the user opted in.
+            if let Some(hook) = cfg.discord_webhook.as_deref() {
+                let _ = notifications::send_discord_webhook(
+                    hook,
+                    &format!("Minecraft server **{name}** ({}) is starting up!", cfg.mc_version),
+                );
+            }
+
             // Pre-start world backup (matching panel.ps1 Run-Server).
             if let Ok(z) = backup::create(&dir, &name, cfg.backup_keep) {
                 me.log(&format!("[blockhost] pre-start backup saved: {}", z.display()));
@@ -543,15 +553,31 @@ impl Manager {
                         "[blockhost] stopped after {crashes} crashes in 10 minutes"
                     ));
                     let (_, recent) = me.logs_since(0);
-                    *me.0.last_crash.lock().unwrap() = crash::analyze_logs(&recent).or_else(|| {
-                        Some(CrashDiagnosis {
-                            title: "Server kept crashing".into(),
-                            explanation: "The server crashed repeatedly so BlockHost paused restarts.".into(),
-                            suggestion: "Check the Console tab for the last error message.".into(),
-                        })
+                    let diag = crash::analyze_logs(&recent).unwrap_or_else(|| CrashDiagnosis {
+                        title: "Server kept crashing".into(),
+                        explanation: "The server crashed repeatedly so BlockHost paused restarts.".into(),
+                        suggestion: "Check the Console tab for the last error message.".into(),
                     });
+                    if let Some(hook) = cfg.discord_webhook.as_deref() {
+                        let _ = notifications::send_discord_webhook(
+                            hook,
+                            &format!(
+                                "Minecraft server **{name}** stopped after repeated crashes: {} ({})",
+                                diag.title, diag.suggestion
+                            ),
+                        );
+                    }
+                    *me.0.last_crash.lock().unwrap() = Some(diag);
                 }
-                Ok(o) => me.log(&format!("[blockhost] stopped: {o:?}")),
+                Ok(o) => {
+                    me.log(&format!("[blockhost] stopped: {o:?}"));
+                    if let Some(hook) = cfg.discord_webhook.as_deref() {
+                        let _ = notifications::send_discord_webhook(
+                            hook,
+                            &format!("Minecraft server **{name}** has stopped safely."),
+                        );
+                    }
+                }
                 Err(e) => {
                     me.log(&format!("[blockhost] error: {e:#}"));
                     let (_, recent) = me.logs_since(0);

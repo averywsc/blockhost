@@ -83,6 +83,7 @@ pub struct StatusSnapshot {
     pub perf_mode: Option<bool>,
     pub aikar_flags: bool,
     pub duckdns_domain: Option<String>,
+    pub discord_enabled: bool,
     pub tailscale_ip: Option<String>,
     pub autostart_enabled: bool,
     pub lan_ip: Option<String>,

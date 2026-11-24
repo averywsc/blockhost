@@ -57,6 +57,7 @@ export interface StatusSnapshot {
   perf_mode: boolean | null;
   aikar_flags: boolean;
   duckdns_domain: string | null;
+  discord_enabled: boolean;
   tailscale_ip: string | null;
   autostart_enabled: boolean;
   lan_ip: string | null;
@@ -191,6 +192,14 @@ export interface ActionResult {
   message: string;
 }
 
+export interface AppUpdateInfo {
+  current_version: string;
+  latest_version: string;
+  update_available: boolean;
+  release_url: string;
+  notes: string;
+}
+
 export type CoreEvent =
   | ({ kind: "status_changed" } & StatusSnapshot)
   | { kind: "log_line"; index: number; line: string }
@@ -287,6 +296,12 @@ export const api = {
     invoke<ActionResult>("remove_port_forward", { serverName }),
   saveDuckdns: (serverName: string, domain: string, token: string) =>
     invoke<string>("save_duckdns", { serverName, domain, token }),
+  exportDiagnostics: (serverName: string) =>
+    invoke<string | null>("export_diagnostics", { serverName }),
+  saveDiscordWebhook: (serverName: string, webhookUrl: string, sendTest: boolean) =>
+    invoke<string>("save_discord_webhook", { serverName, webhookUrl, sendTest }),
+  checkAppUpdate: () => invoke<AppUpdateInfo>("check_app_update"),
+  applyLaptopLidPower: () => invoke<string>("apply_laptop_lid_power"),
   openFolder: (serverName?: string, sub?: string) =>
     invoke<void>("open_folder", { serverName: serverName ?? null, sub: sub ?? null }),
   openUrl: (url: string) => invoke<void>("open_url", { url }),

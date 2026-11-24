@@ -93,6 +93,7 @@
         perf_mode: true,
         aikar_flags: true,
         duckdns_domain: "kiwi-smp.duckdns.org",
+        discord_enabled: false,
         tailscale_ip: null,
         autostart_enabled: false,
         lan_ip: "192.168.1.42",

@@ -1,0 +1,47 @@
+name: Release Installer
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  publish-windows:
+    name: Build Windows NSIS Installer
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/desktop/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: apps/desktop
+        run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build Tauri NSIS installer
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: apps/desktop
+          tagName: ${{ github.ref_type == 'tag' && github.ref_name || 'v0.1.0-preview' }}
+          releaseName: "BlockHost ${{ github.ref_type == 'tag' && github.ref_name || 'Preview' }}"
+          releaseBody: |
+            ## BlockHost for Windows
+
+            Double-click the installer (`BlockHost_*_x64-setup.exe`) to install BlockHost for your user account (no administrator password required).
+
+            - One-click **Paper** (plugins) or **Fabric** (mods) server setup with Minecraft version picker
+            - Runs quietly in the system tray to stay light on old 4 GB laptops
+            - Direct port forwarding + DuckDNS + Tailscale detection for low NZ ping (plus optional playit.gg tunnel)
+            - Upload/export world `.zip`, automatic backups, plain-English crash analyzer, and full admin controls
+          releaseDraft: true
+          prerelease: false
+          args: --bundles nsis

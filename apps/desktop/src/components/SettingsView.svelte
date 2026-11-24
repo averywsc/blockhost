@@ -2,6 +2,7 @@
   import {
     api,
     formatGb,
+    type AppUpdateInfo,
     type ResolvedPaper,
     type StatusSnapshot,
     type UpdateStatus,
@@ -31,6 +32,9 @@
 
   let confirmWhitelistOff = $state(false);
   let pendingMajorUpdate = $state<ResolvedPaper | null>(null);
+  let discordWebhook = $state("");
+  let appUpdate = $state<AppUpdateInfo | null>(null);
+  let checkingApp = $state(false);
 
   const serverName = $derived(status.current ?? "");
   const isRunning = $derived(status.running !== null && status.running === serverName);
@@ -139,6 +143,59 @@
       busy = false;
     }
   }
+
+  async function saveDiscord(sendTest: boolean) {
+    if (!serverName) return;
+    busy = true;
+    try {
+      const msg = await api.saveDiscordWebhook(serverName, discordWebhook.trim(), sendTest);
+      onNotify(msg);
+      if (discordWebhook.trim()) discordWebhook = "";
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function exportDiag() {
+    if (!serverName) return;
+    busy = true;
+    try {
+      const msg = await api.exportDiagnostics(serverName);
+      if (msg) onNotify(msg);
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function checkBlockHostUpdate() {
+    checkingApp = true;
+    try {
+      appUpdate = await api.checkAppUpdate();
+      if (!appUpdate.update_available) {
+        onNotify(`BlockHost v${appUpdate.current_version} is up to date.`);
+      }
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      checkingApp = false;
+    }
+  }
+
+  async function configureLidPower() {
+    busy = true;
+    try {
+      const msg = await api.applyLaptopLidPower();
+      onNotify(msg);
+    } catch (e) {
+      onNotify(String(e), "error");
+    } finally {
+      busy = false;
+    }
+  }
 </script>
 
 <div class="stack">
@@ -235,6 +292,16 @@
 
     <div class="subcard toggle-row">
       <div class="stack-xs">
+        <strong>Keep laptop awake with lid closed (plugged in)</strong>
+        <span class="muted tiny">Sets Windows AC sleep and lid-close action to Do Nothing for 24/7 laptop hosting.</span>
+      </div>
+      <button class="btn btn-sm" disabled={busy} onclick={configureLidPower}>
+        Apply power settings
+      </button>
+    </div>
+
+    <div class="subcard toggle-row">
+      <div class="stack-xs">
         <strong>Only allowed players (Whitelist)</strong>
         <span class="muted tiny">
           {whitelistOn
@@ -307,9 +374,74 @@
     </div>
   {/if}
 
-  <div class="card row-between muted tiny">
-    <span>BlockHost v{status.app_version}</span>
-    <span class="mono">{status.data_dir}</span>
+  <div class="card stack">
+    <div class="row-between">
+      <div class="stack-xs">
+        <div class="row">
+          <h2 class="section-title">Discord notifications</h2>
+          {#if status.discord_enabled}
+            <span class="badge badge-green">Enabled</span>
+          {/if}
+        </div>
+        <span class="muted tiny">
+          Optional webhook to post server start, stop, and crash alerts to your friends Discord channel.
+        </span>
+      </div>
+    </div>
+
+    <div class="row">
+      <input
+        class="input mono grow"
+        type="password"
+        bind:value={discordWebhook}
+        placeholder="https://discord.com/api/webhooks/..."
+      />
+      <button
+        class="btn btn-primary btn-sm"
+        disabled={busy || !discordWebhook.trim()}
+        onclick={() => saveDiscord(true)}
+      >
+        Save and test
+      </button>
+      {#if status.discord_enabled}
+        <button
+          class="btn btn-sm"
+          disabled={busy}
+          onclick={() => {
+            discordWebhook = "";
+            saveDiscord(false);
+          }}
+        >
+          Turn off
+        </button>
+      {/if}
+    </div>
+  </div>
+
+  <div class="card stack">
+    <div class="row-between">
+      <div class="stack-xs">
+        <h2 class="section-title">About BlockHost and diagnostics</h2>
+        <span class="muted tiny mono">v{status.app_version} ({status.data_dir})</span>
+      </div>
+      <div class="row">
+        <button class="btn btn-sm" disabled={busy} onclick={exportDiag}>
+          Export diagnostics (.zip)
+        </button>
+        <button class="btn btn-sm" disabled={checkingApp} onclick={checkBlockHostUpdate}>
+          {checkingApp ? "Checking" : "Check app updates"}
+        </button>
+      </div>
+    </div>
+
+    {#if appUpdate?.update_available}
+      <div class="banner banner-info row-between">
+        <span>BlockHost v{appUpdate.latest_version} is available!</span>
+        <button class="btn btn-primary btn-sm" onclick={() => appUpdate && api.openUrl(appUpdate.release_url)}>
+          Download update
+        </button>
+      </div>
+    {/if}
   </div>
 </div>
 
@@ -366,5 +498,10 @@
   .row-end {
     display: flex;
     justify-content: flex-end;
+  }
+
+  .grow {
+    flex: 1;
+    min-width: 220px;
   }
 </style>

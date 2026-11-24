@@ -3,15 +3,17 @@
 use blockhost_core::{
     autostart, backup,
     config::{self, ServerConfig, ServerSoftware},
+    diagnostics,
     events::{LiveMetrics, StatusSnapshot},
     fabric, hardware,
     manager::Manager,
     network::{self, ActionResult, CgnatReport, LinkInfo, PingStats},
+    notifications::{self, AppUpdateInfo},
     paper::{self, Resolved, UpdateStatus},
     paths,
     players::{self, BannedEntry, PlayerSummary},
     plugins::{self, InstalledPlugin, PluginHit, ResolvedPluginVersion},
-    setup,
+    power, setup,
     world::{self, GameRules},
 };
 use serde::{Deserialize, Serialize};
@@ -678,6 +680,90 @@ async fn save_duckdns(
 }
 
 #[tauri::command]
+async fn export_diagnostics(
+    state: State<'_, AppState>,
+    server_name: String,
+) -> Result<Option<String>, String> {
+    let (_, recent_logs) = state.core.logs_since(0);
+    tauri::async_runtime::spawn_blocking(move || {
+        let picked = rfd::FileDialog::new()
+            .set_title("Save BlockHost diagnostics .zip")
+            .set_file_name(format!("{server_name}-diagnostics.zip"))
+            .add_filter("Diagnostics archive", &["zip"])
+            .save_file();
+        let Some(dest) = picked else {
+            return Ok(None);
+        };
+        let dir = paths::server_dir(&server_name);
+        let saved = diagnostics::export_diagnostics_zip(&dir, &dest, &recent_logs).map_err(friendly_err)?;
+        Ok(Some(format!(
+            "Saved diagnostics (passwords redacted) to {}",
+            saved.display()
+        )))
+    })
+    .await
+    .map_err(|e| format!("Diagnostics export failed: {e}"))?
+}
+
+#[tauri::command]
+async fn save_discord_webhook(
+    state: State<'_, AppState>,
+    server_name: String,
+    webhook_url: String,
+    send_test: bool,
+) -> Result<String, String> {
+    let core = state.core.clone();
+    tauri::async_runtime::spawn_blocking(move || {
+        let dir = paths::server_dir(&server_name);
+        let mut cfg = ServerConfig::load(&dir).map_err(friendly_err)?;
+        let trimmed = webhook_url.trim();
+        if trimmed.is_empty() {
+            cfg.discord_webhook = None;
+            cfg.save(&dir).map_err(friendly_err)?;
+            core.emit_status(Some(&server_name));
+            return Ok("Discord notifications turned off.".into());
+        }
+        if !notifications::valid_discord_webhook(trimmed) {
+            return Err("Webhook URL must start with https://discord.com/api/webhooks/".into());
+        }
+        if send_test {
+            notifications::send_discord_webhook(
+                trimmed,
+                &format!("BlockHost connected to **{server_name}**!"),
+            )
+            .map_err(friendly_err)?;
+        }
+        cfg.discord_webhook = Some(trimmed.to_string());
+        cfg.save(&dir).map_err(friendly_err)?;
+        core.emit_status(Some(&server_name));
+        Ok(if send_test {
+            "Discord webhook saved and test message sent!".into()
+        } else {
+            "Discord webhook saved.".into()
+        })
+    })
+    .await
+    .map_err(|e| format!("Could not save Discord webhook: {e}"))?
+}
+
+#[tauri::command]
+async fn check_app_update() -> Result<AppUpdateInfo, String> {
+    tauri::async_runtime::spawn_blocking(|| notifications::check_app_update().map_err(friendly_err))
+        .await
+        .map_err(|e| format!("App update check failed: {e}"))?
+}
+
+#[tauri::command]
+async fn apply_laptop_lid_power() -> Result<String, String> {
+    tauri::async_runtime::spawn_blocking(|| {
+        power::apply_windows_power().map_err(friendly_err)?;
+        Ok("Windows AC sleep and lid-close sleep disabled while plugged in.".into())
+    })
+    .await
+    .map_err(|e| format!("Power configuration failed: {e}"))?
+}
+
+#[tauri::command]
 fn open_url(url: String) -> Result<(), String> {
     let trimmed = url.trim();
     if !(trimmed.starts_with("http://") || trimmed.starts_with("https://")) {
@@ -822,6 +908,10 @@ fn main() {
             setup_port_forward,
             remove_port_forward,
             save_duckdns,
+            export_diagnostics,
+            save_discord_webhook,
+            check_app_update,
+            apply_laptop_lid_power,
             open_folder,
             open_url,
         ])
